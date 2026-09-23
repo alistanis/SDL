@@ -33,6 +33,27 @@
 #include "SDL_uikitwindow.h"
 #include "SDL_uikitopengles.h"
 
+#ifdef SDL_PLATFORM_IOS
+// Afterglow local diagnostic: leave UIKit's original refresh policy unchanged
+// unless the explicit hint requests an exact rate for a timing comparison.
+#define AFTERGLOW_IOS_REFRESH_RATE_HINT "AFTERGLOW_IOS_REFRESH_RATE"
+@interface SDL_uikitviewcontroller (AfterglowRefreshRate)
+- (void)afterglowApplyRefreshRateHint:(const char *)hint;
+@end
+
+static void SDLCALL Afterglow_RefreshRateHintChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
+{
+    @autoreleasepool {
+        if (!SDL_IsMainThread()) {
+            SDL_LogWarn(SDL_LOG_CATEGORY_VIDEO, "Afterglow refresh-rate hint must change on the main thread");
+            return;
+        }
+        SDL_uikitviewcontroller *viewcontroller = (__bridge SDL_uikitviewcontroller *)userdata;
+        [viewcontroller afterglowApplyRefreshRateHint:hint];
+    }
+}
+#endif
+
 #ifdef SDL_PLATFORM_TVOS
 static void SDLCALL SDL_AppleTVControllerUIHintChanged(void *userdata, const char *name, const char *oldValue, const char *hint)
 {
@@ -72,6 +93,13 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
     int animationInterval;
     void (*animationCallback)(void *);
     void *animationCallbackParam;
+
+#ifdef SDL_PLATFORM_IOS
+    BOOL afterglowRefreshRateOverrideActive;
+    BOOL afterglowOriginalUsesRange;
+    CAFrameRateRange afterglowOriginalFrameRateRange;
+    NSInteger afterglowOriginalFramesPerSecond;
+#endif
 
 #ifdef SDL_IPHONE_KEYBOARD
     SDLUITextField *textField;
@@ -115,15 +143,29 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
                 int frame_rate = (int)mode->refresh_rate;
                 displayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(doLoop:)];
                 displayLink.preferredFrameRateRange = CAFrameRateRangeMake((frame_rate * 2) / 3, frame_rate, frame_rate);
+#ifdef SDL_PLATFORM_IOS
+                afterglowOriginalUsesRange = YES;
+                afterglowOriginalFrameRateRange = displayLink.preferredFrameRateRange;
+#endif
                 [displayLink addToRunLoop:NSRunLoop.currentRunLoop forMode:NSDefaultRunLoopMode];
             }
         }
+#ifdef SDL_PLATFORM_IOS
+        SDL_AddHintCallback(AFTERGLOW_IOS_REFRESH_RATE_HINT,
+                            Afterglow_RefreshRateHintChanged,
+                            (__bridge void *)self);
+#endif
     }
     return self;
 }
 
 - (void)dealloc
 {
+#ifdef SDL_PLATFORM_IOS
+    SDL_RemoveHintCallback(AFTERGLOW_IOS_REFRESH_RATE_HINT,
+                            Afterglow_RefreshRateHintChanged,
+                            (__bridge void *)self);
+#endif
 #ifdef SDL_IPHONE_KEYBOARD
     [self deinitKeyboard];
 #endif
@@ -176,6 +218,13 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
     displayLink.preferredFramesPerSecond = data.uiwindow.screen.maximumFramesPerSecond / animationInterval;
 #endif
 
+#ifdef SDL_PLATFORM_IOS
+    afterglowOriginalUsesRange = NO;
+    afterglowOriginalFramesPerSecond = displayLink.preferredFramesPerSecond;
+    afterglowRefreshRateOverrideActive = NO;
+    [self afterglowApplyRefreshRateHint:SDL_GetHint(AFTERGLOW_IOS_REFRESH_RATE_HINT)];
+#endif
+
     [displayLink addToRunLoop:[NSRunLoop currentRunLoop] forMode:NSDefaultRunLoopMode];
 }
 
@@ -183,7 +232,42 @@ static void SDLCALL SDL_HideHomeIndicatorHintChanged(void *userdata, const char 
 {
     [displayLink invalidate];
     displayLink = nil;
+#ifdef SDL_PLATFORM_IOS
+    afterglowRefreshRateOverrideActive = NO;
+#endif
 }
+
+#ifdef SDL_PLATFORM_IOS
+- (void)afterglowApplyRefreshRateHint:(const char *)hint
+{
+    if (@available(iOS 15.0, *)) {
+        if (!displayLink) {
+            return;
+        }
+        const int requested = hint && SDL_strcmp(hint, "80") == 0 ? 80 :
+            (hint && SDL_strcmp(hint, "120") == 0 ? 120 : 0);
+        if (requested > 0) {
+            displayLink.preferredFrameRateRange = CAFrameRateRangeMake(requested, requested, requested);
+            afterglowRefreshRateOverrideActive = YES;
+        } else if (afterglowRefreshRateOverrideActive) {
+            if (afterglowOriginalUsesRange) {
+                displayLink.preferredFrameRateRange = afterglowOriginalFrameRateRange;
+            } else {
+                displayLink.preferredFrameRateRange = CAFrameRateRangeDefault;
+                displayLink.preferredFramesPerSecond = afterglowOriginalFramesPerSecond;
+            }
+            afterglowRefreshRateOverrideActive = NO;
+        } else {
+            return;
+        }
+        const CAFrameRateRange range = displayLink.preferredFrameRateRange;
+        SDL_LogInfo(SDL_LOG_CATEGORY_APPLICATION,
+                    "AfterglowUIKit/refresh requested=%s min=%.1f max=%.1f preferred=%.1f callback_fps=%ld",
+                    requested ? hint : "auto", range.minimum, range.maximum, range.preferred,
+                    (long)displayLink.preferredFramesPerSecond);
+    }
+}
+#endif
 
 - (void)doLoop:(CADisplayLink *)sender
 {

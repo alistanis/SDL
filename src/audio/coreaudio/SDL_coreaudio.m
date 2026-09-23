@@ -565,6 +565,9 @@ static Uint8 *COREAUDIO_GetDeviceBuf(SDL_AudioDevice *device, int *buffer_size)
 static void PlaybackBufferReadyCallback(void *inUserData, AudioQueueRef inAQ, AudioQueueBufferRef inBuffer)
 {
     SDL_AudioDevice *device = (SDL_AudioDevice *)inUserData;
+    if (!device->hidden) {
+        return;  // AFTERGLOW LOCAL PATCH: late callback during close; backend state is gone.
+    }
     SDL_assert(inBuffer != NULL);  // ...right?
     SDL_assert(device->hidden->current_buffer == NULL);  // shouldn't have anything pending
     device->hidden->current_buffer = inBuffer;
@@ -608,6 +611,9 @@ static void RecordingBufferReadyCallback(void *inUserData, AudioQueueRef inAQ, A
                           const AudioStreamPacketDescription *inPacketDescs)
 {
     SDL_AudioDevice *device = (SDL_AudioDevice *)inUserData;
+    if (!device->hidden) {
+        return;  // AFTERGLOW LOCAL PATCH: late callback during close; backend state is gone.
+    }
     SDL_assert(inAQ == device->hidden->audioQueue);
     SDL_assert(inBuffer != NULL);  // ...right?
     SDL_assert(device->hidden->current_buffer == NULL);  // shouldn't have anything pending
@@ -627,11 +633,14 @@ static void COREAUDIO_CloseDevice(SDL_AudioDevice *device)
         return;
     }
 
-    // dispose of the audio queue before waiting on the thread, or it might stall for a long time!
+    // Dispose of the audio queue before waiting on the thread, or it might stall for a long time!
+    // AFTERGLOW LOCAL PATCH: disposal must be synchronous. An asynchronous
+    // dispose can leave buffer callbacks in flight after close tears down
+    // device state; a late callback then writes through freed memory.
     if (device->hidden->audioQueue) {
         AudioQueueFlush(device->hidden->audioQueue);
         AudioQueueStop(device->hidden->audioQueue, 0);
-        AudioQueueDispose(device->hidden->audioQueue, 0);
+        AudioQueueDispose(device->hidden->audioQueue, 1);
     }
 
     if (device->hidden->thread) {

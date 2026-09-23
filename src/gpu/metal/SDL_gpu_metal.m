@@ -25,6 +25,13 @@
 
 #include <Metal/Metal.h>
 #include <QuartzCore/CoreAnimation.h>
+#include <stdatomic.h>
+#include <float.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <errno.h>
+#include <os/signpost.h>
+#include <SDL3/SDL_accelerando_timing.h>
 
 #include "../SDL_sysgpu.h"
 
@@ -34,25 +41,313 @@
 #define WINDOW_PROPERTY_DATA           "SDL.internal.gpu.metal.data"
 #define SDL_GPU_SHADERSTAGE_COMPUTE    2
 
-#define TRACK_RESOURCE(resource, type, array, count, capacity)   \
-    do {                                                         \
-        Uint32 i;                                                \
-                                                                 \
-        for (i = 0; i < commandBuffer->count; i += 1) {          \
-            if (commandBuffer->array[i] == (resource)) {         \
-                return;                                          \
-            }                                                    \
-        }                                                        \
-                                                                 \
-        if (commandBuffer->count == commandBuffer->capacity) {   \
-            commandBuffer->capacity += 1;                        \
-            commandBuffer->array = SDL_realloc(                  \
-                commandBuffer->array,                            \
-                commandBuffer->capacity * sizeof(type));         \
-        }                                                        \
-        commandBuffer->array[commandBuffer->count] = (resource); \
-        commandBuffer->count += 1;                               \
-        SDL_AtomicIncRef(&(resource)->referenceCount);           \
+// Optional investigation counters: 128 render passes, four timestamps each.
+// The 4 KiB timestamp buffer stays below Metal's 32 KiB counter-buffer limit.
+#define AFTERGLOW_MAX_TIMED_PASSES 128
+#define AFTERGLOW_MAX_PASS_SHADERS 8
+typedef struct AfterglowMetalPassRecord
+{
+    Uint32 width, height, drawCount, shaderCount;
+    Uint64 vertices;
+    Uint32 shaderHashes[AFTERGLOW_MAX_PASS_SHADERS];
+    Uint32 shaderDraws[AFTERGLOW_MAX_PASS_SHADERS];
+} AfterglowMetalPassRecord;
+
+// This object has its own lifetime, independent of SDL's recycled wrappers.
+// Its recording metadata is immutable after commit until the callback releases
+// the lease. An early wrapper reuse skips sampling instead of overwriting it.
+@interface AfterglowMetalPassSamples : NSObject {
+@public
+    id<MTLCounterSampleBuffer> buffer;
+    SDL_AtomicInt busy;
+    Uint32 passCount, droppedPasses;
+    Uint64 acquisition, cpuStart, gpuStart;
+    AfterglowMetalPassRecord passes[AFTERGLOW_MAX_TIMED_PASSES];
+}
+@end
+@implementation AfterglowMetalPassSamples
+@end
+
+// AFTERGLOW OPTIONAL PRESENTATION RECORDER BEGIN
+// Native presented handlers may outlive SDL's device/window/fence wrappers.
+// Each block retains this independent owner; it owns no native drawables.
+#define AFTERGLOW_PRESENTATION_CAPACITY 131072U
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2 && ATOMIC_LLONG_LOCK_FREE == 2,
+               "Presentation recording requires lock-free integer publication");
+#define AFTERGLOW_PRESENTATION_SUBMITTED 1U
+#define AFTERGLOW_PRESENTATION_COMPLETED 2U
+#define AFTERGLOW_PRESENTATION_NIL 4U
+
+typedef struct AfterglowMetalPresentationRecord
+{
+    Uint64 submission, layer, drawableID;
+    Uint64 requestBeforeNS, requestAfterNS, callbackDrawableID;
+    double requestHostTime, presentedHostTime, callbackHostTime;
+    _Atomic(Uint32) flags;
+} AfterglowMetalPresentationRecord;
+
+@interface AfterglowMetalPresentations : NSObject {
+@public
+    AfterglowMetalPresentationRecord *records;
+    char *outputPath;
+    _Atomic(Uint64) reserved, overflow, nilDrawables;
+    _Atomic(Uint32) completed;
+    _Atomic(bool) exported;
+    Uint64 startBeforeNS, startAfterNS;
+    double startHostTime;
+}
+- (instancetype)initWithPath:(const char *)path;
+@end
+
+@implementation AfterglowMetalPresentations
+- (instancetype)initWithPath:(const char *)path
+{
+    self = [super init];
+    if (self) {
+        outputPath = SDL_strdup(path);
+        records = SDL_calloc(AFTERGLOW_PRESENTATION_CAPACITY, sizeof(*records));
+        if (!outputPath || !records) return nil;
+        atomic_init(&reserved, 0);
+        atomic_init(&completed, 0);
+        atomic_init(&overflow, 0);
+        atomic_init(&nilDrawables, 0);
+        atomic_init(&exported, false);
+        for (Uint32 i = 0; i < AFTERGLOW_PRESENTATION_CAPACITY; ++i) {
+            atomic_init(&records[i].flags, 0);
+        }
+        startBeforeNS = SDL_GetTicksNS();
+        startHostTime = CACurrentMediaTime();
+        startAfterNS = SDL_GetTicksNS();
+    }
+    return self;
+}
+- (void)dealloc
+{
+    SDL_free(records);
+    SDL_free(outputPath);
+}
+@end
+
+static AfterglowMetalPresentations *METAL_INTERNAL_AfterglowCreatePresentations(void)
+{
+    const char *path = SDL_getenv("AFTERGLOW_METAL_PRESENTATIONS");
+    if (!path || !*path) return nil;
+    if (@available(macOS 10.15.4, iOS 10.3, tvOS 10.3, *)) {
+        AfterglowMetalPresentations *owner = [[AfterglowMetalPresentations alloc] initWithPath:path];
+        if (!owner) {
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/presentations allocation failed");
+        } else {
+            SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/presentations enabled path=%s capacity=%u bytes=%zu",
+                path, AFTERGLOW_PRESENTATION_CAPACITY,
+                AFTERGLOW_PRESENTATION_CAPACITY * sizeof(*owner->records));
+        }
+        return owner;
+    }
+    SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/presentations unsupported OS");
+    return nil;
+}
+
+static Uint32 METAL_INTERNAL_AfterglowReservePresentation(
+    AfterglowMetalPresentations *owner, Uint64 submission, Uint64 layer,
+    Uint64 drawableID, bool nilDrawable)
+{
+    const Uint64 attempt = atomic_fetch_add_explicit(&owner->reserved, 1, memory_order_relaxed);
+    if (nilDrawable) atomic_fetch_add_explicit(&owner->nilDrawables, 1, memory_order_relaxed);
+    if (attempt >= AFTERGLOW_PRESENTATION_CAPACITY) {
+        atomic_fetch_add_explicit(&owner->overflow, 1, memory_order_relaxed);
+        return UINT32_MAX;
+    }
+    const Uint32 slot = (Uint32)attempt;
+    AfterglowMetalPresentationRecord *record = &owner->records[slot];
+    record->submission = submission;
+    record->layer = layer;
+    record->drawableID = drawableID;
+    record->requestBeforeNS = SDL_GetTicksNS();
+    record->requestHostTime = CACurrentMediaTime();
+    record->requestAfterNS = SDL_GetTicksNS();
+    atomic_store_explicit(&record->flags, AFTERGLOW_PRESENTATION_SUBMITTED |
+        (nilDrawable ? AFTERGLOW_PRESENTATION_NIL : 0U), memory_order_release);
+    return slot;
+}
+
+static void METAL_INTERNAL_AfterglowCompletePresentation(
+    AfterglowMetalPresentations *owner, Uint32 slot, double presentedTime,
+    Uint64 drawableID)
+{
+    AfterglowMetalPresentationRecord *record = &owner->records[slot];
+    record->callbackHostTime = CACurrentMediaTime();
+    record->callbackDrawableID = drawableID;
+    record->presentedHostTime = presentedTime;
+    atomic_store_explicit(&record->flags, AFTERGLOW_PRESENTATION_SUBMITTED |
+        AFTERGLOW_PRESENTATION_COMPLETED, memory_order_release);
+    atomic_fetch_add_explicit(&owner->completed, 1, memory_order_relaxed);
+}
+
+static void METAL_INTERNAL_AfterglowRecordPresentation(
+    AfterglowMetalPresentations *owner, id<MTLDrawable> drawable,
+    Uint64 submission, Uint64 layer)
+{
+    if (@available(macOS 10.15.4, iOS 10.3, tvOS 10.3, *)) {
+        const Uint32 slot = METAL_INTERNAL_AfterglowReservePresentation(
+            owner, submission, layer, drawable ? drawable.drawableID : 0, drawable == nil);
+        if (slot == UINT32_MAX || !drawable) return;
+        [drawable addPresentedHandler:^(id<MTLDrawable> presented) {
+            METAL_INTERNAL_AfterglowCompletePresentation(
+                owner, slot, presented.presentedTime, presented.drawableID);
+        }];
+    }
+}
+
+static void METAL_INTERNAL_AfterglowWriteJSONString(FILE *file, const char *value)
+{
+    fputc('"', file);
+    if (value) {
+        for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
+            if (*p == '"' || *p == '\\') fprintf(file, "\\%c", *p);
+            else if (*p < 0x20) fprintf(file, "\\u%04x", *p);
+            else fputc(*p, file);
+        }
+    }
+    fputc('"', file);
+}
+
+static void METAL_INTERNAL_AfterglowExportPresentations(
+    AfterglowMetalPresentations *owner, Uint64 captureEpochNS, const char *capturePath)
+{
+    if (atomic_exchange_explicit(&owner->exported, true, memory_order_acq_rel)) return;
+    const Uint64 attempts = atomic_load_explicit(&owner->reserved, memory_order_acquire);
+    const Uint32 count = (Uint32)SDL_min(attempts, (Uint64)AFTERGLOW_PRESENTATION_CAPACITY);
+    const Uint32 completedAtStart = atomic_load_explicit(&owner->completed, memory_order_acquire);
+    const Uint64 endBeforeNS = SDL_GetTicksNS();
+    const double endHostTime = CACurrentMediaTime();
+    const Uint64 endAfterNS = SDL_GetTicksNS();
+    const int descriptor = open(owner->outputPath, O_WRONLY | O_CREAT | O_EXCL, 0600);
+    FILE *file = descriptor < 0 ? NULL : fdopen(descriptor, "w");
+    if (!file) {
+        const int failure = errno;
+        if (descriptor >= 0) close(descriptor);
+        SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/presentations export failed path=%s errno=%d",
+                     owner->outputPath, failure);
+        return;
+    }
+    fprintf(file, "{\"type\":\"metadata\",\"schema\":1,\"capacity\":%u,\"record_bytes\":%zu,"
+        "\"capture_epoch_sdl_ns\":%" SDL_PRIu64 ",\"capture_path\":",
+        AFTERGLOW_PRESENTATION_CAPACITY, sizeof(*owner->records), captureEpochNS);
+    METAL_INTERNAL_AfterglowWriteJSONString(file, capturePath);
+    fprintf(file, ",\"start_before_sdl_ns\":%" SDL_PRIu64 ",\"start_host_s\":%.9f,"
+        "\"start_after_sdl_ns\":%" SDL_PRIu64 ",\"end_before_sdl_ns\":%" SDL_PRIu64
+        ",\"end_host_s\":%.9f,\"end_after_sdl_ns\":%" SDL_PRIu64 "}\n",
+        owner->startBeforeNS, owner->startHostTime, owner->startAfterNS,
+        endBeforeNS, endHostTime, endAfterNS);
+    Uint32 completedSnapshot = 0, positive = 0, zero = 0, invalid = 0, nilCount = 0;
+    for (Uint32 i = 0; i < count; ++i) {
+        const AfterglowMetalPresentationRecord *record = &owner->records[i];
+        const Uint32 flags = atomic_load_explicit(&record->flags, memory_order_acquire);
+        // Callback-owned fields are read only after their release publication.
+        const bool ready = (flags & AFTERGLOW_PRESENTATION_COMPLETED) != 0;
+        const bool submitted = (flags & AFTERGLOW_PRESENTATION_SUBMITTED) != 0;
+        const bool nilDrawable = (flags & AFTERGLOW_PRESENTATION_NIL) != 0;
+        const double time = ready ? record->presentedHostTime : 0.0;
+        const bool validTime = time >= 0.0 && time <= DBL_MAX;
+        const char *status = !submitted ? "reserved" : nilDrawable ? "nil_drawable" :
+            !ready ? "pending" : !validTime ? "invalid" : time == 0.0 ? "zero" : "presented";
+        completedSnapshot += ready;
+        nilCount += nilDrawable;
+        positive += ready && validTime && time > 0.0;
+        zero += ready && time == 0.0;
+        invalid += ready && !validTime;
+        fprintf(file, "{\"type\":\"presentation\",\"slot\":%u,\"submission\":%" SDL_PRIu64
+            ",\"layer\":%" SDL_PRIu64 ",\"drawable_id\":%" SDL_PRIu64
+            ",\"request_before_sdl_ns\":%" SDL_PRIu64 ",\"request_host_s\":%.9f,"
+            "\"request_after_sdl_ns\":%" SDL_PRIu64 ",\"callback_host_s\":%.9f"
+            ",\"callback_drawable_id\":%" SDL_PRIu64 ",\"presented_host_s\":",
+            i, submitted ? record->submission : 0, submitted ? record->layer : 0,
+            submitted ? record->drawableID : 0, submitted ? record->requestBeforeNS : 0,
+            submitted ? record->requestHostTime : 0.0, submitted ? record->requestAfterNS : 0,
+            ready ? record->callbackHostTime : 0.0, ready ? record->callbackDrawableID : 0);
+        if (ready && validTime) fprintf(file, "%.9f", time); else fputs("null", file);
+        fprintf(file, ",\"status\":\"%s\"}\n", status);
+    }
+    fprintf(file, "{\"type\":\"footer\",\"reserved\":%" SDL_PRIu64 ",\"records\":%u,"
+        "\"completed_snapshot\":%u,\"positive\":%u,\"zero\":%u,\"invalid\":%u,\"nil\":%u,"
+        "\"missing\":%u,\"overflow\":%" SDL_PRIu64 ",\"completed_at_export_start\":%u,"
+        "\"completed_at_export_end\":%u,\"nil_total\":%" SDL_PRIu64 "}\n",
+        attempts, count, completedSnapshot, positive, zero, invalid, nilCount,
+        count - completedSnapshot - nilCount,
+        atomic_load_explicit(&owner->overflow, memory_order_acquire), completedAtStart,
+        atomic_load_explicit(&owner->completed, memory_order_acquire),
+        atomic_load_explicit(&owner->nilDrawables, memory_order_acquire));
+    const bool writeFailed = ferror(file) != 0;
+    const bool closeFailed = fclose(file) != 0;
+    SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+        "AfterglowMetal/presentations exported path=%s records=%u complete=%u missing=%u overflow=%" SDL_PRIu64 " success=%d",
+        owner->outputPath, count, completedSnapshot, count - completedSnapshot - nilCount,
+        atomic_load_explicit(&owner->overflow, memory_order_relaxed), !writeFailed && !closeFailed);
+}
+// AFTERGLOW OPTIONAL PRESENTATION RECORDER END
+
+// Keep the resource set used by a typical command buffer in the command
+// buffer itself. Metal command buffers can remain in flight for several
+// frames, so growing these arrays lazily makes otherwise allocation-free
+// rendering depend on when a pooled command buffer is first used. Larger
+// workloads retain the existing dynamically growing fallback.
+#define METAL_INLINE_USED_BUFFER_CAPACITY         64
+#define METAL_INLINE_USED_TEXTURE_CAPACITY        64
+#define METAL_INLINE_USED_UNIFORM_BUFFER_CAPACITY 32
+// GPU render submission cycles its retained vertex upload/destination
+// buffers whenever an earlier command buffer can still reference them. Keep
+// the bounded wrapper/pointer ring in the container itself: allocating one
+// MetalBuffer wrapper at each new high-water mark otherwise leaks SDL
+// calloc/realloc calls into the first live frames after loading. Native Metal
+// objects are still created lazily in these prepared slots, so static asset
+// buffers do not multiply their VRAM footprint.
+#define METAL_INLINE_CYCLED_BUFFER_CAPACITY        16
+
+#define TRACK_RESOURCE(resource, type, array, inline_array, count, capacity) \
+    do {                                                                       \
+        Uint32 i;                                                              \
+                                                                               \
+        for (i = 0; i < commandBuffer->count; i += 1) {                        \
+            if (commandBuffer->array[i] == (resource)) {                       \
+                return;                                                        \
+            }                                                                  \
+        }                                                                      \
+                                                                               \
+        if (commandBuffer->count == commandBuffer->capacity) {                 \
+            if (commandBuffer->capacity > SDL_MAX_UINT32 / 2 ||                \
+                (size_t)(commandBuffer->capacity * 2) >                        \
+                    SDL_SIZE_MAX / sizeof(type)) {                             \
+                SDL_OutOfMemory();                                             \
+                SDL_AtomicIncRef(&(resource)->referenceCount);                 \
+                return;                                                        \
+            }                                                                  \
+            const Uint32 newCapacity = commandBuffer->capacity * 2;            \
+            type *newArray;                                                    \
+            if (commandBuffer->array == commandBuffer->inline_array) {         \
+                newArray = (type *)SDL_malloc(newCapacity * sizeof(type));     \
+                if (newArray) {                                                \
+                    SDL_memcpy(                                                \
+                        newArray,                                              \
+                        commandBuffer->inline_array,                           \
+                        commandBuffer->count * sizeof(type));                  \
+                }                                                              \
+            } else {                                                           \
+                newArray = (type *)SDL_realloc(                                \
+                    commandBuffer->array,                                      \
+                    newCapacity * sizeof(type));                               \
+            }                                                                  \
+            if (!newArray) {                                                   \
+                /* Retain forever rather than permit a GPU use-after-free. */  \
+                SDL_AtomicIncRef(&(resource)->referenceCount);                 \
+                return;                                                        \
+            }                                                                  \
+            commandBuffer->array = newArray;                                   \
+            commandBuffer->capacity = newCapacity;                             \
+        }                                                                      \
+        commandBuffer->array[commandBuffer->count] = (resource);               \
+        commandBuffer->count += 1;                                             \
+        SDL_AtomicIncRef(&(resource)->referenceCount);                         \
     } while (0)
 
 #define SET_ERROR_AND_RETURN(fmt, msg, ret)               \
@@ -450,6 +745,8 @@ typedef struct MetalFence
 {
     id<MTLCommandBuffer> commandBuffer;
     SDL_AtomicInt referenceCount;
+    // AFTERGLOW TEMPORARY DIAGNOSTICS: assigned before submission/publication.
+    Uint64 afterglowDiagnosticSubmission;
 } MetalFence;
 
 typedef struct MetalWindowData
@@ -465,6 +762,7 @@ typedef struct MetalWindowData
     MetalTextureContainer textureContainer;
     SDL_GPUFence *inFlightFences[MAX_FRAMES_IN_FLIGHT];
     Uint32 frameCounter;
+    Uint64 afterglowPresentationLayer;
 } MetalWindowData;
 
 typedef struct MetalShader
@@ -477,6 +775,7 @@ typedef struct MetalShader
     Uint32 numUniformBuffers;
     Uint32 numStorageBuffers;
     Uint32 numStorageTextures;
+    Uint32 afterglowSourceHash;
 } MetalShader;
 
 typedef struct MetalGraphicsPipeline
@@ -487,6 +786,7 @@ typedef struct MetalGraphicsPipeline
 
     SDL_GPURasterizerState rasterizerState;
     SDL_GPUPrimitiveType primitiveType;
+    Uint32 afterglowFragmentHash;
 
     id<MTLDepthStencilState> depth_stencil_state;
 } MetalGraphicsPipeline;
@@ -515,6 +815,8 @@ typedef struct MetalBufferContainer
     Uint32 bufferCapacity;
     Uint32 bufferCount;
     MetalBuffer **buffers;
+    MetalBuffer inlineBuffers[METAL_INLINE_CYCLED_BUFFER_CAPACITY];
+    MetalBuffer *inlineBufferPointers[METAL_INLINE_CYCLED_BUFFER_CAPACITY];
 
     bool isPrivate;
     bool isWriteOnly;
@@ -531,10 +833,15 @@ typedef struct MetalUniformBuffer
 typedef struct MetalCommandBuffer
 {
     CommandBufferCommonHeader common;
+    AfterglowMetalPassSamples *afterglowPassSamples;
+    bool afterglowPassSampling;
+    Sint32 afterglowActiveTimedPass;
     MetalRenderer *renderer;
 
     // Native Handle
     id<MTLCommandBuffer> handle;
+    // AFTERGLOW TEMPORARY DIAGNOSTIC: zero if created outside our capture.
+    Uint64 afterglowCaptureGeneration;
 
     // Presentation
     MetalWindowData **windowDatas;
@@ -596,6 +903,7 @@ typedef struct MetalCommandBuffer
     id<MTLBuffer> computeReadWriteBuffers[MAX_COMPUTE_WRITE_BUFFERS];
     MetalUniformBuffer *computeUniformBuffers[MAX_UNIFORM_BUFFERS_PER_STAGE];
 
+    MetalUniformBuffer *inlineUsedUniformBuffers[METAL_INLINE_USED_UNIFORM_BUFFER_CAPACITY];
     MetalUniformBuffer **usedUniformBuffers;
     Uint32 usedUniformBufferCount;
     Uint32 usedUniformBufferCapacity;
@@ -604,10 +912,12 @@ typedef struct MetalCommandBuffer
     MetalFence *fence;
 
     // Reference Counting
+    MetalBuffer *inlineUsedBuffers[METAL_INLINE_USED_BUFFER_CAPACITY];
     MetalBuffer **usedBuffers;
     Uint32 usedBufferCount;
     Uint32 usedBufferCapacity;
 
+    MetalTexture *inlineUsedTextures[METAL_INLINE_USED_TEXTURE_CAPACITY];
     MetalTexture **usedTextures;
     Uint32 usedTextureCount;
     Uint32 usedTextureCapacity;
@@ -633,8 +943,37 @@ struct MetalRenderer
     id<MTLCommandQueue> queue;
 
     bool debugMode;
+    // AFTERGLOW TEMPORARY DIAGNOSTICS: immutable settings, and a sequence
+    // counter protected by submitLock. Remove after the device investigation.
+    AfterglowMetalPresentations *afterglowPresentations;
+    Uint64 afterglowNextPresentationLayer;
+    bool afterglowDiagnosticsEnabled;
+    Uint64 afterglowDiagnosticSampleInterval;
+    Uint64 afterglowDiagnosticSubmission;
+    Uint64 afterglowNextThermalSampleNS;
+    Sint32 afterglowThermalState;
+    Sint32 afterglowLowPowerModeState;
+    Uint32 afterglowPassTimestampMode;
+    Uint32 afterglowPassCounterBuffers;
+    Uint64 afterglowPassAcquisition;
+    id<MTLCounterSet> afterglowTimestampCounterSet;
+    // Protected by afterglowCaptureLock; never accessed by completion handlers.
+    SDL_Mutex *afterglowCaptureLock;
+    bool afterglowCaptureActive;
+    Uint64 afterglowCaptureGeneration;
+    NSString *afterglowCapturePath;
     SDL_PropertiesID props;
     Uint32 allowedFramesInFlight;
+
+    // Accelerando opt-in CPU timings, written only by the device owner thread.
+    bool timingEnabled;
+    bool timingActive;
+    bool timingSignposts;
+    SDL_ThreadID timingOwner;
+    Uint64 timingSequence;
+    SDL_AccelerandoGPUTimingSample timingSample;
+    os_log_t timingLog;
+    os_signpost_id_t timingSignpostID;
 
     MetalWindowData **claimedWindows;
     Uint32 claimedWindowCount;
@@ -690,6 +1029,432 @@ struct MetalRenderer
 
 // Helper Functions
 
+static void METAL_INTERNAL_AfterglowCreatePassSamples(
+    MetalRenderer *renderer, MetalCommandBuffer *commandBuffer)
+{
+    if (!renderer->afterglowTimestampCounterSet ||
+        renderer->afterglowPassCounterBuffers >= 32) {
+        return;
+    }
+    if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+        MTLCounterSampleBufferDescriptor *descriptor = [MTLCounterSampleBufferDescriptor new];
+        descriptor.counterSet = renderer->afterglowTimestampCounterSet;
+        descriptor.storageMode = MTLStorageModeShared;
+        descriptor.sampleCount = AFTERGLOW_MAX_TIMED_PASSES * 4;
+        descriptor.label = @"Afterglow optional render-pass timestamps";
+        NSError *error = nil;
+        id<MTLCounterSampleBuffer> buffer = [renderer->device
+            newCounterSampleBufferWithDescriptor:descriptor error:&error];
+        if (buffer) {
+            AfterglowMetalPassSamples *samples = [AfterglowMetalPassSamples new];
+            samples->buffer = buffer;
+            commandBuffer->afterglowPassSamples = samples;
+            renderer->afterglowPassCounterBuffers += 1;
+        } else {
+            SDL_LogError(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/pass_timestamps allocation failed: %s",
+                error.localizedDescription.UTF8String);
+        }
+    }
+}
+
+static void METAL_INTERNAL_AfterglowAcquirePassSamples(
+    MetalRenderer *renderer, MetalCommandBuffer *commandBuffer)
+{
+    commandBuffer->afterglowPassSampling = false;
+    commandBuffer->afterglowActiveTimedPass = -1;
+    if (!renderer->afterglowPassTimestampMode) {
+        return;
+    }
+    const Uint64 acquisition = ++renderer->afterglowPassAcquisition;
+    if (renderer->afterglowPassTimestampMode == 1 && acquisition % 30 != 0) {
+        return;
+    }
+    AfterglowMetalPassSamples *samples = commandBuffer->afterglowPassSamples;
+    if (samples && SDL_CompareAndSwapAtomicInt(&samples->busy, 0, 1)) {
+        samples->passCount = 0;
+        samples->droppedPasses = 0;
+        samples->acquisition = acquisition;
+        SDL_zeroa(samples->passes);
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            [renderer->device sampleTimestamps:&samples->cpuStart gpuTimestamp:&samples->gpuStart];
+        }
+        commandBuffer->afterglowPassSampling = true;
+    }
+}
+
+static void METAL_INTERNAL_AfterglowRecordPassDraw(
+    MetalCommandBuffer *commandBuffer, Uint32 draws, Uint64 vertices)
+{
+    if (!commandBuffer->afterglowPassSampling || commandBuffer->afterglowActiveTimedPass < 0) {
+        return;
+    }
+    AfterglowMetalPassRecord *pass = &commandBuffer->afterglowPassSamples->passes[
+        commandBuffer->afterglowActiveTimedPass];
+    pass->drawCount += draws;
+    pass->vertices += vertices;
+    const Uint32 hash = commandBuffer->graphics_pipeline->afterglowFragmentHash;
+    Uint32 index = 0;
+    while (index < pass->shaderCount && pass->shaderHashes[index] != hash) {
+        index += 1;
+    }
+    if (index < AFTERGLOW_MAX_PASS_SHADERS) {
+        if (index == pass->shaderCount) {
+            pass->shaderHashes[index] = hash;
+            pass->shaderCount += 1;
+        }
+        pass->shaderDraws[index] += draws;
+    }
+}
+
+static double METAL_INTERNAL_AfterglowTimestampMilliseconds(
+    Uint64 start, Uint64 end, Uint64 gpuLower, Uint64 gpuUpper,
+    double nanosecondsPerGPUTick)
+{
+    if (start == 0 || end == 0 || start == MTLCounterErrorValue ||
+        end == MTLCounterErrorValue || end < start || start < gpuLower ||
+        end > gpuUpper || nanosecondsPerGPUTick <= 0.0) {
+        return -1.0;
+    }
+    return (double)(end - start) * nanosecondsPerGPUTick / 1000000.0;
+}
+
+// Called only with an exclusively leased, strongly retained native owner.
+// No SDL renderer, fence, command-buffer wrapper or pipeline is captured.
+static void METAL_INTERNAL_AfterglowCompletePassSamples(
+    AfterglowMetalPassSamples *samples, id<MTLCommandBuffer> nativeBuffer,
+    Uint64 submission, bool logPeriodic)
+{
+    @autoreleasepool {
+        if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+            if (nativeBuffer.status != MTLCommandBufferStatusCompleted) {
+                SDL_LogError(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/pass_timestamps incomplete submission=%" SDL_PRIu64 " status=%d",
+                    submission, (int)nativeBuffer.status);
+                SDL_SetAtomicInt(&samples->busy, 0);
+                return;
+            }
+            const double gpuMs = (nativeBuffer.GPUEndTime - nativeBuffer.GPUStartTime) * 1000.0;
+            if (samples->passCount && (gpuMs > 12.0 || logPeriodic)) {
+                MTLTimestamp cpuEnd = 0, gpuEnd = 0;
+                [nativeBuffer.device sampleTimestamps:&cpuEnd gpuTimestamp:&gpuEnd];
+                const double scale = cpuEnd > samples->cpuStart && gpuEnd > samples->gpuStart
+                    ? (double)(cpuEnd - samples->cpuStart) / (double)(gpuEnd - samples->gpuStart) : -1.0;
+                NSData *resolved = [samples->buffer resolveCounterRange:
+                    NSMakeRange(0, samples->passCount * 4)];
+                SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/pass_timestamps submission=%" SDL_PRIu64
+                    " acquisition=%" SDL_PRIu64 " passes=%u dropped=%u gpu_ms=%.3f"
+                    " cpu_start=%" SDL_PRIu64 " cpu_end=%" SDL_PRIu64
+                    " gpu_start=%" SDL_PRIu64 " gpu_end=%" SDL_PRIu64 " ns_per_tick=%.9f",
+                    submission, samples->acquisition, samples->passCount, samples->droppedPasses,
+                    gpuMs, samples->cpuStart, (Uint64)cpuEnd, samples->gpuStart, (Uint64)gpuEnd, scale);
+                if (resolved.length >= samples->passCount * 4 * sizeof(MTLCounterResultTimestamp)) {
+                    const MTLCounterResultTimestamp *timestamps = resolved.bytes;
+                    for (Uint32 i = 0; i < samples->passCount; i += 1) {
+                        const AfterglowMetalPassRecord *pass = &samples->passes[i];
+                        const Uint64 vs = timestamps[i * 4].timestamp;
+                        const Uint64 ve = timestamps[i * 4 + 1].timestamp;
+                        const Uint64 fs = timestamps[i * 4 + 2].timestamp;
+                        const Uint64 fe = timestamps[i * 4 + 3].timestamp;
+                        char shaders[256] = { 0 };
+                        size_t written = 0;
+                        for (Uint32 j = 0; j < pass->shaderCount; j += 1) {
+                            written += SDL_snprintf(shaders + written, sizeof(shaders) - written,
+                                "%s%08x:%u", j ? "," : "", pass->shaderHashes[j], pass->shaderDraws[j]);
+                        }
+                        SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                            "AfterglowMetal/pass submission=%" SDL_PRIu64 " pass=%u target=%ux%u"
+                            " draws=%u vertices=%" SDL_PRIu64 " vertex_ms=%.6f fragment_ms=%.6f"
+                            " v_start_ticks=%" SDL_PRIu64 " v_end_ticks=%" SDL_PRIu64
+                            " f_start_ticks=%" SDL_PRIu64 " f_end_ticks=%" SDL_PRIu64 " shaders=%s",
+                            submission, i, pass->width, pass->height, pass->drawCount, pass->vertices,
+                            METAL_INTERNAL_AfterglowTimestampMilliseconds(vs, ve, samples->gpuStart, gpuEnd, scale),
+                            METAL_INTERNAL_AfterglowTimestampMilliseconds(fs, fe, samples->gpuStart, gpuEnd, scale),
+                            vs, ve, fs, fe, shaders);
+                    }
+                } else {
+                    SDL_LogError(SDL_LOG_CATEGORY_GPU,
+                        "AfterglowMetal/pass_timestamps resolve failed submission=%" SDL_PRIu64 " bytes=%u",
+                        submission, (Uint32)resolved.length);
+                }
+            }
+        }
+        // Final owner access: a reused wrapper may now start a new recording.
+        SDL_SetAtomicInt(&samples->busy, 0);
+    }
+}
+
+// AFTERGLOW TEMPORARY DIAGNOSTIC: MTLCaptureManager only records command
+// buffers created after capture starts and committed before capture stops.
+// Keep the start and native allocation together, and identify that capture on
+// each buffer so a previously acquired buffer cannot stop a newer capture.
+static void METAL_INTERNAL_AfterglowAcquireNativeCommandBuffer(
+    MetalRenderer *renderer,
+    MetalCommandBuffer *commandBuffer)
+{
+    commandBuffer->afterglowCaptureGeneration = 0;
+    if (!renderer->afterglowCaptureLock) {
+        commandBuffer->handle = [renderer->queue commandBuffer];
+        return;
+    }
+
+    SDL_LockMutex(renderer->afterglowCaptureLock);
+    NSString *requestedPath = nil;
+    SDL_LockProperties(renderer->props);
+    const char *request = SDL_GetStringProperty(
+        renderer->props, "afterglow.metal.capture_request", NULL);
+    if (request) {
+        requestedPath = [NSString stringWithUTF8String:request];
+        SDL_ClearProperty(renderer->props, "afterglow.metal.capture_request");
+    }
+    SDL_UnlockProperties(renderer->props);
+
+    if (requestedPath) {
+        NSString *failure = nil;
+        if (renderer->afterglowCaptureActive) {
+            failure = @"a capture is already active";
+        } else if (![requestedPath isAbsolutePath] ||
+                   ![requestedPath.pathExtension isEqualToString:@"gputrace"]) {
+            failure = @"capture requires an absolute .gputrace path";
+        } else if ([[NSFileManager defaultManager] fileExistsAtPath:requestedPath]) {
+            failure = @"capture output already exists; choose a new path";
+        } else if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
+            MTLCaptureManager *manager = [MTLCaptureManager sharedCaptureManager];
+            if (![manager supportsDestination:MTLCaptureDestinationGPUTraceDocument]) {
+                failure = @"GPU trace capture unsupported; enable MetalCaptureEnabled in the diagnostic app plist";
+            } else if (manager.isCapturing) {
+                failure = @"another Metal capture is already active";
+            } else {
+                MTLCaptureDescriptor *descriptor = [MTLCaptureDescriptor new];
+                descriptor.captureObject = renderer->queue;
+                descriptor.destination = MTLCaptureDestinationGPUTraceDocument;
+                descriptor.outputURL = [NSURL fileURLWithPath:requestedPath];
+                NSError *error = nil;
+                if ([manager startCaptureWithDescriptor:descriptor error:&error]) {
+                    renderer->afterglowCaptureActive = true;
+                    renderer->afterglowCaptureGeneration += 1;
+                    renderer->afterglowCapturePath = requestedPath;
+                    SDL_SetStringProperty(renderer->props, "afterglow.metal.capture_status",
+                        [[@"recording: " stringByAppendingString:requestedPath] UTF8String]);
+                    SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                        "AfterglowMetal/capture started generation=%" SDL_PRIu64 " path=%s",
+                        renderer->afterglowCaptureGeneration, requestedPath.UTF8String);
+                } else {
+                    failure = error.localizedDescription ?: @"Metal rejected the capture request";
+                }
+            }
+        } else {
+            failure = @"GPU trace capture requires macOS 10.15 or iOS/tvOS 13";
+        }
+        if (failure) {
+            SDL_SetStringProperty(renderer->props, "afterglow.metal.capture_status",
+                [[@"error: " stringByAppendingString:failure] UTF8String]);
+            SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/capture failed path=%s reason=%s",
+                requestedPath.UTF8String, failure.UTF8String);
+        }
+    }
+
+    commandBuffer->handle = [renderer->queue commandBuffer];
+    if (renderer->afterglowCaptureActive) {
+        commandBuffer->afterglowCaptureGeneration = renderer->afterglowCaptureGeneration;
+    }
+    SDL_UnlockMutex(renderer->afterglowCaptureLock);
+}
+
+// devicectl cannot export the buffer aliases Metal puts inside a .gputrace.
+// Replace only internal file symlinks in this newly created capture package.
+static bool METAL_INTERNAL_AfterglowMaterializeCaptureLinks(
+    NSString *capturePath,
+    Uint32 *materializedCount,
+    Uint32 *errorCount)
+{
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSError *error = nil;
+    NSDictionary *rootAttributes = [fileManager attributesOfItemAtPath:capturePath error:&error];
+    *materializedCount = 0;
+    *errorCount = 0;
+    if (![rootAttributes[NSFileType] isEqualToString:NSFileTypeDirectory]) {
+        *errorCount = 1;
+        SDL_LogError(SDL_LOG_CATEGORY_GPU,
+            "AfterglowMetal/capture export failed path=%s reason=%s",
+            capturePath.UTF8String,
+            (error.localizedDescription ?: @"capture output is not a regular directory").UTF8String);
+        return false;
+    }
+
+    NSURL *rootURL = [[NSURL fileURLWithPath:capturePath isDirectory:YES]
+        URLByResolvingSymlinksInPath].URLByStandardizingPath;
+    NSString *rootPrefix = [rootURL.path stringByAppendingString:@"/"];
+    NSDirectoryEnumerator<NSURL *> *entries = [fileManager
+        enumeratorAtURL:rootURL
+        includingPropertiesForKeys:nil
+        options:0
+        errorHandler:^BOOL(NSURL *url, NSError *enumerationError) {
+            *errorCount += 1;
+            SDL_LogError(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/capture export enumeration failed path=%s reason=%s",
+                url.path.UTF8String, enumerationError.localizedDescription.UTF8String);
+            return YES;
+        }];
+    if (entries == nil) {
+        *errorCount += 1;
+    }
+    for (NSURL *entryURL in entries) {
+        @autoreleasepool {
+            error = nil;
+            NSDictionary *attributes = [fileManager attributesOfItemAtPath:entryURL.path error:&error];
+            NSString *failure = nil;
+            if (attributes == nil) {
+                failure = error.localizedDescription ?: @"could not inspect capture entry";
+            } else if ([attributes[NSFileType] isEqualToString:NSFileTypeSymbolicLink]) {
+                // The enumerator does not descend through symlinks. Check both
+                // the alias's parent and its resolved target before any I/O.
+                NSURL *parentURL = [entryURL.URLByDeletingLastPathComponent
+                    URLByResolvingSymlinksInPath].URLByStandardizingPath;
+                NSURL *targetURL = [entryURL URLByResolvingSymlinksInPath].URLByStandardizingPath;
+                const bool parentInside = [parentURL.path isEqualToString:rootURL.path] ||
+                    [parentURL.path hasPrefix:rootPrefix];
+                if (!parentInside || ![targetURL.path hasPrefix:rootPrefix]) {
+                    failure = @"refusing a symlink outside the capture package";
+                } else {
+                    NSDictionary *targetAttributes = [fileManager
+                        attributesOfItemAtPath:targetURL.path error:&error];
+                    if (![targetAttributes[NSFileType] isEqualToString:NSFileTypeRegular]) {
+                        failure = error.localizedDescription ?: @"symlink target is not a regular file";
+                    } else {
+                        NSData *contents = [NSData dataWithContentsOfURL:targetURL options:0 error:&error];
+                        if (contents == nil ||
+                            ![contents writeToURL:entryURL options:NSDataWritingAtomic error:&error]) {
+                            failure = error.localizedDescription ?: @"could not materialize capture symlink";
+                        } else {
+                            // Atomic writing replaces the alias, preserving its
+                            // target and leaving complete bytes at the alias path.
+                            *materializedCount += 1;
+                        }
+                    }
+                }
+            }
+            if (failure) {
+                *errorCount += 1;
+                SDL_LogError(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/capture export entry failed path=%s reason=%s",
+                    entryURL.path.UTF8String, failure.UTF8String);
+            }
+        }
+    }
+    SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+        "AfterglowMetal/capture export path=%s materialized=%u errors=%u",
+        capturePath.UTF8String, *materializedCount, *errorCount);
+    return *errorCount == 0;
+}
+
+static void METAL_INTERNAL_AfterglowStopCapture(
+    MetalRenderer *renderer,
+    Uint64 generation)
+{
+    if (!renderer->afterglowCaptureLock) {
+        return;
+    }
+    SDL_LockMutex(renderer->afterglowCaptureLock);
+    if (renderer->afterglowCaptureActive &&
+        (generation == 0 || generation == renderer->afterglowCaptureGeneration)) {
+        [[MTLCaptureManager sharedCaptureManager] stopCapture];
+        Uint32 materializedCount = 0;
+        Uint32 exportErrors = 0;
+        const bool exportReady = METAL_INTERNAL_AfterglowMaterializeCaptureLinks(
+            renderer->afterglowCapturePath, &materializedCount, &exportErrors);
+        SDL_SetStringProperty(renderer->props, "afterglow.metal.capture_status",
+            [[NSString stringWithFormat:@"%@: %@ (materialized=%u errors=%u)",
+                exportReady ? @"stopped, export ready" : @"error preparing stopped capture for export",
+                renderer->afterglowCapturePath, materializedCount, exportErrors] UTF8String]);
+        SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+            "AfterglowMetal/capture stopped generation=%" SDL_PRIu64 " path=%s",
+            renderer->afterglowCaptureGeneration, renderer->afterglowCapturePath.UTF8String);
+        renderer->afterglowCaptureActive = false;
+        renderer->afterglowCapturePath = nil;
+    }
+    SDL_UnlockMutex(renderer->afterglowCaptureLock);
+}
+
+static bool METAL_INTERNAL_TimingActive(MetalRenderer *renderer)
+{
+    // Check the immutable owner before reading mutable sample state. GPU calls
+    // on worker threads must not race the main thread's capture or counters.
+    return renderer->timingEnabled && renderer->timingOwner == SDL_GetCurrentThreadID() && renderer->timingActive;
+}
+
+static void METAL_INTERNAL_TimingAdd(MetalRenderer *renderer, SDL_AccelerandoGPUTimingPhase phase, Uint64 duration)
+{
+    renderer->timingSample.duration_ns[phase] += duration;
+    renderer->timingSample.calls[phase] += 1;
+}
+
+static void METAL_INTERNAL_TimingSignpost(MetalRenderer *renderer, SDL_AccelerandoGPUTimingPhase phase, bool begin)
+{
+    if (!renderer->timingSignposts) return;
+    if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, *)) {
+        // Literal names keep Instruments events readable without formatting or
+        // message construction. Signposts are separate from timing captures.
+#define TIMING_SIGNPOST_CASE(phase_name, label) \
+        case phase_name: \
+            if (begin) os_signpost_interval_begin(renderer->timingLog, renderer->timingSignpostID, label); \
+            else os_signpost_interval_end(renderer->timingLog, renderer->timingSignpostID, label); \
+            break
+        switch (phase) {
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_FENCE_WAIT, "GPU fence wait");
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_NEXT_DRAWABLE, "nextDrawable");
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_SUBMIT_LOCK, "GPU submit lock");
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_PRESENT_DRAWABLE, "presentDrawable");
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_COMMIT, "GPU commit");
+            TIMING_SIGNPOST_CASE(SDL_ACCELERANDO_GPU_SUBMIT_CLEANUP, "GPU submit cleanup");
+            default: break;
+        }
+#undef TIMING_SIGNPOST_CASE
+    }
+}
+
+static bool SDLCALL METAL_TimingBegin(SDL_GPUDevice *device)
+{
+    if (!device) return false;
+    MetalRenderer *renderer = (MetalRenderer *)device->driverData;
+    if (!renderer->timingEnabled || renderer->timingOwner != SDL_GetCurrentThreadID()) return false;
+    SDL_zero(renderer->timingSample);
+    renderer->timingSample.sequence = ++renderer->timingSequence;
+    renderer->timingSample.begin_ns = SDL_GetTicksNS();
+    renderer->timingActive = true;
+    return true;
+}
+
+static bool SDLCALL METAL_TimingRead(SDL_GPUDevice *device, SDL_AccelerandoGPUTimingSample *sample)
+{
+    if (!device || !sample) return false;
+    MetalRenderer *renderer = (MetalRenderer *)device->driverData;
+    if (!METAL_INTERNAL_TimingActive(renderer)) return false;
+    renderer->timingSample.end_ns = SDL_GetTicksNS();
+    renderer->timingActive = false;
+    *sample = renderer->timingSample;
+    return true;
+}
+
+static bool SDLCALL METAL_TimingIsActive(SDL_GPUDevice *device)
+{
+    return device && METAL_INTERNAL_TimingActive((MetalRenderer *)device->driverData);
+}
+
+static void SDLCALL METAL_TimingAddDuration(SDL_GPUDevice *device, SDL_AccelerandoGPUTimingPhase phase, Uint64 duration)
+{
+    if (device && (unsigned)phase < SDL_ACCELERANDO_GPU_TIMING_PHASE_COUNT) {
+        MetalRenderer *renderer = (MetalRenderer *)device->driverData;
+        if (METAL_INTERNAL_TimingActive(renderer)) METAL_INTERNAL_TimingAdd(renderer, phase, duration);
+    }
+}
+
+static const SDL_AccelerandoGPUTimingAPI metalTimingAPI = {
+    SDL_ACCELERANDO_GPU_TIMING_VERSION, sizeof(SDL_AccelerandoGPUTimingSample),
+    METAL_TimingBegin, METAL_TimingRead, METAL_TimingIsActive, METAL_TimingAddDuration
+};
+
 // FIXME: This should be moved into SDL_sysgpu.h
 static inline Uint32 METAL_INTERNAL_NextHighestAlignment(
     Uint32 n,
@@ -706,6 +1471,13 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
 
     // Flush any remaining GPU work...
     METAL_Wait(device->driverData);
+    METAL_INTERNAL_AfterglowStopCapture(renderer, 0);
+    if (renderer->afterglowPresentations) {
+        METAL_INTERNAL_AfterglowExportPresentations(renderer->afterglowPresentations,
+            (Uint64)SDL_GetNumberProperty(renderer->props, "afterglow.presentation.capture_epoch_ns", 0),
+            SDL_GetStringProperty(renderer->props, "afterglow.presentation.capture_path", ""));
+        renderer->afterglowPresentations = nil;
+    }
 
     // Release the window data
     for (Sint32 i = renderer->claimedWindowCount - 1; i >= 0; i -= 1) {
@@ -730,10 +1502,17 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     // Release command buffer infrastructure
     for (Uint32 i = 0; i < renderer->availableCommandBufferCount; i += 1) {
         MetalCommandBuffer *commandBuffer = renderer->availableCommandBuffers[i];
-        SDL_free(commandBuffer->usedBuffers);
-        SDL_free(commandBuffer->usedTextures);
-        SDL_free(commandBuffer->usedUniformBuffers);
+        if (commandBuffer->usedBuffers != commandBuffer->inlineUsedBuffers) {
+            SDL_free(commandBuffer->usedBuffers);
+        }
+        if (commandBuffer->usedTextures != commandBuffer->inlineUsedTextures) {
+            SDL_free(commandBuffer->usedTextures);
+        }
+        if (commandBuffer->usedUniformBuffers != commandBuffer->inlineUsedUniformBuffers) {
+            SDL_free(commandBuffer->usedUniformBuffers);
+        }
         SDL_free(commandBuffer->windowDatas);
+        commandBuffer->afterglowPassSamples = nil;
         SDL_free(commandBuffer);
     }
     SDL_free(renderer->availableCommandBuffers);
@@ -752,9 +1531,12 @@ static void METAL_DestroyDevice(SDL_GPUDevice *device)
     SDL_DestroyMutex(renderer->disposeLock);
     SDL_DestroyMutex(renderer->fenceLock);
     SDL_DestroyMutex(renderer->windowLock);
+    SDL_DestroyMutex(renderer->afterglowCaptureLock);
 
     // Release the command queue
+    renderer->afterglowTimestampCounterSet = nil;
     renderer->queue = nil;
+    renderer->timingLog = nil;
 
     // Release properties
     SDL_DestroyProperties(renderer->props);
@@ -780,6 +1562,7 @@ static void METAL_INTERNAL_TrackBuffer(
         buffer,
         MetalBuffer *,
         usedBuffers,
+        inlineUsedBuffers,
         usedBufferCount,
         usedBufferCapacity);
 }
@@ -792,6 +1575,7 @@ static void METAL_INTERNAL_TrackTexture(
         texture,
         MetalTexture *,
         usedTextures,
+        inlineUsedTextures,
         usedTextureCount,
         usedTextureCapacity);
 }
@@ -808,10 +1592,35 @@ static void METAL_INTERNAL_TrackUniformBuffer(
     }
 
     if (commandBuffer->usedUniformBufferCount == commandBuffer->usedUniformBufferCapacity) {
-        commandBuffer->usedUniformBufferCapacity += 1;
-        commandBuffer->usedUniformBuffers = SDL_realloc(
-            commandBuffer->usedUniformBuffers,
-            commandBuffer->usedUniformBufferCapacity * sizeof(MetalUniformBuffer *));
+        if (commandBuffer->usedUniformBufferCapacity > SDL_MAX_UINT32 / 2 ||
+            (size_t)(commandBuffer->usedUniformBufferCapacity * 2) >
+                SDL_SIZE_MAX / sizeof(MetalUniformBuffer *)) {
+            // This buffer remains checked out of the pool, which is safer
+            // than recycling it while the GPU can still reference it.
+            SDL_OutOfMemory();
+            return;
+        }
+        const Uint32 newCapacity = commandBuffer->usedUniformBufferCapacity * 2;
+        MetalUniformBuffer **newUniformBuffers;
+        if (commandBuffer->usedUniformBuffers == commandBuffer->inlineUsedUniformBuffers) {
+            newUniformBuffers = (MetalUniformBuffer **)SDL_malloc(
+                newCapacity * sizeof(MetalUniformBuffer *));
+            if (newUniformBuffers) {
+                SDL_memcpy(
+                    newUniformBuffers,
+                    commandBuffer->inlineUsedUniformBuffers,
+                    commandBuffer->usedUniformBufferCount * sizeof(MetalUniformBuffer *));
+            }
+        } else {
+            newUniformBuffers = (MetalUniformBuffer **)SDL_realloc(
+                commandBuffer->usedUniformBuffers,
+                newCapacity * sizeof(MetalUniformBuffer *));
+        }
+        if (!newUniformBuffers) {
+            return;
+        }
+        commandBuffer->usedUniformBuffers = newUniformBuffers;
+        commandBuffer->usedUniformBufferCapacity = newCapacity;
     }
 
     commandBuffer->usedUniformBuffers[commandBuffer->usedUniformBufferCount] = uniformBuffer;
@@ -962,12 +1771,26 @@ static void METAL_INTERNAL_DestroyBufferContainer(
 {
     for (Uint32 i = 0; i < container->bufferCount; i += 1) {
         container->buffers[i]->handle = nil;
-        SDL_free(container->buffers[i]);
+        bool isInline = false;
+        for (Uint32 inlineIndex = 0;
+             inlineIndex < METAL_INLINE_CYCLED_BUFFER_CAPACITY;
+             inlineIndex += 1) {
+            if (container->buffers[i] ==
+                &container->inlineBuffers[inlineIndex]) {
+                isInline = true;
+                break;
+            }
+        }
+        if (!isInline) {
+            SDL_free(container->buffers[i]);
+        }
     }
     if (container->debugName != NULL) {
         SDL_free(container->debugName);
     }
-    SDL_free(container->buffers);
+    if (container->buffers != container->inlineBufferPointers) {
+        SDL_free(container->buffers);
+    }
     SDL_free(container);
 }
 
@@ -1222,7 +2045,21 @@ static SDL_GPUGraphicsPipeline *METAL_CreateGraphicsPipeline(
 
         // Create the graphics pipeline
 
+        const Uint64 afterglowPipelineStart = renderer->afterglowDiagnosticsEnabled ? SDL_GetTicksNS() : 0;
         pipelineState = [renderer->device newRenderPipelineStateWithDescriptor:pipelineDescriptor error:&error];
+        if (renderer->afterglowDiagnosticsEnabled) {
+            const SDL_GPUColorTargetDescription *target = createinfo->target_info.num_color_targets > 0
+                ? &createinfo->target_info.color_target_descriptions[0] : NULL;
+            SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/pipeline_create duration_ms=%.3f fragment=%08x vertex=%08x primitive=%u target=%u blend=%u src=%u dst=%u success=%u",
+                (double)(SDL_GetTicksNS() - afterglowPipelineStart) / 1000000.0,
+                fragmentShader->afterglowSourceHash, vertexShader->afterglowSourceHash,
+                createinfo->primitive_type, target ? target->format : 0,
+                target ? target->blend_state.enable_blend : 0,
+                target ? target->blend_state.src_color_blendfactor : 0,
+                target ? target->blend_state.dst_color_blendfactor : 0,
+                pipelineState != nil);
+        }
         if (error != NULL) {
             SET_ERROR_AND_RETURN("Creating render pipeline failed: %s", [[error description] UTF8String], NULL);
         }
@@ -1232,6 +2069,7 @@ static SDL_GPUGraphicsPipeline *METAL_CreateGraphicsPipeline(
         result->depth_stencil_state = depthStencilState;
         result->rasterizerState = createinfo->rasterizer_state;
         result->primitiveType = createinfo->primitive_type;
+        result->afterglowFragmentHash = fragmentShader->afterglowSourceHash;
         result->header.num_vertex_samplers = vertexShader->numSamplers;
         result->header.num_vertex_uniform_buffers = vertexShader->numUniformBuffers;
         result->header.num_vertex_storage_buffers = vertexShader->numStorageBuffers;
@@ -1396,6 +2234,7 @@ static SDL_GPUShader *METAL_CreateShader(
     const SDL_GPUShaderCreateInfo *createinfo)
 {
     @autoreleasepool {
+        MetalRenderer *renderer = (MetalRenderer *)driverData;
         MetalLibraryFunction libraryFunction;
         MetalShader *result;
 
@@ -1417,6 +2256,16 @@ static SDL_GPUShader *METAL_CreateShader(
         result->numSamplers = createinfo->num_samplers;
         result->numStorageBuffers = createinfo->num_storage_buffers;
         result->numStorageTextures = createinfo->num_storage_textures;
+        if (renderer->afterglowDiagnosticsEnabled) {
+            Uint32 hash = 2166136261U;
+            for (size_t i = 0; i < createinfo->code_size; i += 1) {
+                hash = (hash ^ createinfo->code[i]) * 16777619U;
+            }
+            result->afterglowSourceHash = hash;
+            SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/pass_shader hash=%08x stage=%u entry=%s bytes=%u",
+                hash, createinfo->stage, createinfo->entrypoint, (Uint32)createinfo->code_size);
+        }
         result->numUniformBuffers = createinfo->num_uniform_buffers;
         return (SDL_GPUShader *)result;
     }
@@ -1579,14 +2428,14 @@ static MetalTexture *METAL_INTERNAL_PrepareTextureForWrite(
 }
 
 // This function assumes that it's called from within an autorelease pool
-static MetalBuffer *METAL_INTERNAL_CreateBuffer(
+static bool METAL_INTERNAL_InitBuffer(
     MetalRenderer *renderer,
+    MetalBuffer *metalBuffer,
     Uint32 size,
     MTLResourceOptions resourceOptions,
     const char *debugName)
 {
     id<MTLBuffer> bufferHandle;
-    MetalBuffer *metalBuffer;
 
     // Storage buffers have to be 4-aligned, so might as well align them all
     size = METAL_INTERNAL_NextHighestAlignment(size, 4);
@@ -1594,10 +2443,9 @@ static MetalBuffer *METAL_INTERNAL_CreateBuffer(
     bufferHandle = [renderer->device newBufferWithLength:size options:resourceOptions];
     if (bufferHandle == NULL) {
         SDL_LogError(SDL_LOG_CATEGORY_GPU, "Could not create buffer");
-        return NULL;
+        return false;
     }
 
-    metalBuffer = SDL_calloc(1, sizeof(MetalBuffer));
     metalBuffer->handle = bufferHandle;
     SDL_SetAtomicInt(&metalBuffer->referenceCount, 0);
 
@@ -1605,6 +2453,24 @@ static MetalBuffer *METAL_INTERNAL_CreateBuffer(
         metalBuffer->handle.label = @(debugName);
     }
 
+    return true;
+}
+
+static MetalBuffer *METAL_INTERNAL_CreateBuffer(
+    MetalRenderer *renderer,
+    Uint32 size,
+    MTLResourceOptions resourceOptions,
+    const char *debugName)
+{
+    MetalBuffer *metalBuffer = SDL_calloc(1, sizeof(MetalBuffer));
+    if (metalBuffer == NULL) {
+        return NULL;
+    }
+    if (!METAL_INTERNAL_InitBuffer(
+            renderer, metalBuffer, size, resourceOptions, debugName)) {
+        SDL_free(metalBuffer);
+        return NULL;
+    }
     return metalBuffer;
 }
 
@@ -1620,10 +2486,9 @@ static MetalBufferContainer *METAL_INTERNAL_CreateBufferContainer(
     MTLResourceOptions resourceOptions;
 
     container->size = size;
-    container->bufferCapacity = 1;
+    container->bufferCapacity = METAL_INLINE_CYCLED_BUFFER_CAPACITY;
     container->bufferCount = 1;
-    container->buffers = SDL_calloc(
-        container->bufferCapacity, sizeof(MetalBuffer *));
+    container->buffers = container->inlineBufferPointers;
     container->isPrivate = isPrivate;
     container->isWriteOnly = isWriteOnly;
     container->debugName = NULL;
@@ -1641,11 +2506,13 @@ static MetalBufferContainer *METAL_INTERNAL_CreateBufferContainer(
         }
     }
 
-    container->buffers[0] = METAL_INTERNAL_CreateBuffer(
-        renderer,
-        size,
-        resourceOptions,
-        debugName);
+    container->buffers[0] = &container->inlineBuffers[0];
+    if (!METAL_INTERNAL_InitBuffer(
+            renderer, container->buffers[0], size, resourceOptions,
+            debugName)) {
+        SDL_free(container);
+        return NULL;
+    }
 
     container->activeBuffer = container->buffers[0];
 
@@ -1724,12 +2591,34 @@ static MetalBuffer *METAL_INTERNAL_PrepareBufferForWrite(
             }
         }
 
-        EXPAND_ARRAY_IF_NEEDED(
-            container->buffers,
-            MetalBuffer *,
-            container->bufferCount + 1,
-            container->bufferCapacity,
-            container->bufferCapacity + 1);
+        if (container->bufferCount == container->bufferCapacity) {
+            if (container->bufferCapacity > SDL_MAX_UINT32 / 2 ||
+                (size_t)(container->bufferCapacity * 2) >
+                    SDL_SIZE_MAX / sizeof(MetalBuffer *)) {
+                SDL_OutOfMemory();
+                return container->activeBuffer;
+            }
+            const Uint32 newCapacity = container->bufferCapacity * 2;
+            MetalBuffer **newBuffers;
+            if (container->buffers == container->inlineBufferPointers) {
+                newBuffers = (MetalBuffer **)SDL_malloc(
+                    newCapacity * sizeof(MetalBuffer *));
+                if (newBuffers != NULL) {
+                    SDL_memcpy(newBuffers, container->inlineBufferPointers,
+                               container->bufferCount *
+                                   sizeof(MetalBuffer *));
+                }
+            } else {
+                newBuffers = (MetalBuffer **)SDL_realloc(
+                    container->buffers,
+                    newCapacity * sizeof(MetalBuffer *));
+            }
+            if (newBuffers == NULL) {
+                return container->activeBuffer;
+            }
+            container->buffers = newBuffers;
+            container->bufferCapacity = newCapacity;
+        }
 
         if (container->isPrivate) {
             resourceOptions = MTLResourceStorageModePrivate;
@@ -1741,11 +2630,25 @@ static MetalBuffer *METAL_INTERNAL_PrepareBufferForWrite(
             }
         }
 
-        container->buffers[container->bufferCount] = METAL_INTERNAL_CreateBuffer(
-            renderer,
-            container->size,
-            resourceOptions,
-            container->debugName);
+        MetalBuffer *newBuffer;
+        if (container->bufferCount <
+            METAL_INLINE_CYCLED_BUFFER_CAPACITY) {
+            newBuffer =
+                &container->inlineBuffers[container->bufferCount];
+            if (!METAL_INTERNAL_InitBuffer(
+                    renderer, newBuffer, container->size, resourceOptions,
+                    container->debugName)) {
+                return container->activeBuffer;
+            }
+        } else {
+            newBuffer = METAL_INTERNAL_CreateBuffer(
+                renderer, container->size, resourceOptions,
+                container->debugName);
+            if (newBuffer == NULL) {
+                return container->activeBuffer;
+            }
+        }
+        container->buffers[container->bufferCount] = newBuffer;
         container->bufferCount += 1;
 
         container->activeBuffer = container->buffers[container->bufferCount - 1];
@@ -2040,6 +2943,7 @@ static void METAL_INTERNAL_AllocateCommandBuffers(
     for (Uint32 i = 0; i < allocateCount; i += 1) {
         commandBuffer = SDL_calloc(1, sizeof(MetalCommandBuffer));
         commandBuffer->renderer = renderer;
+        METAL_INTERNAL_AfterglowCreatePassSamples(renderer, commandBuffer);
 
         // The native Metal command buffer is created in METAL_AcquireCommandBuffer
 
@@ -2049,15 +2953,17 @@ static void METAL_INTERNAL_AllocateCommandBuffers(
             commandBuffer->windowDataCapacity, sizeof(MetalWindowData *));
 
         // Reference Counting
-        commandBuffer->usedBufferCapacity = 4;
+        commandBuffer->usedBufferCapacity = METAL_INLINE_USED_BUFFER_CAPACITY;
         commandBuffer->usedBufferCount = 0;
-        commandBuffer->usedBuffers = SDL_calloc(
-            commandBuffer->usedBufferCapacity, sizeof(MetalBuffer *));
+        commandBuffer->usedBuffers = commandBuffer->inlineUsedBuffers;
 
-        commandBuffer->usedTextureCapacity = 4;
+        commandBuffer->usedTextureCapacity = METAL_INLINE_USED_TEXTURE_CAPACITY;
         commandBuffer->usedTextureCount = 0;
-        commandBuffer->usedTextures = SDL_calloc(
-            commandBuffer->usedTextureCapacity, sizeof(MetalTexture *));
+        commandBuffer->usedTextures = commandBuffer->inlineUsedTextures;
+
+        commandBuffer->usedUniformBufferCapacity = METAL_INLINE_USED_UNIFORM_BUFFER_CAPACITY;
+        commandBuffer->usedUniformBufferCount = 0;
+        commandBuffer->usedUniformBuffers = commandBuffer->inlineUsedUniformBuffers;
 
         renderer->availableCommandBuffers[renderer->availableCommandBufferCount] = commandBuffer;
         renderer->availableCommandBufferCount += 1;
@@ -2141,11 +3047,14 @@ static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
     @autoreleasepool {
         MetalRenderer *renderer = (MetalRenderer *)driverData;
         MetalCommandBuffer *commandBuffer;
+        const bool trace = METAL_INTERNAL_TimingActive(renderer);
+        const Uint64 start = trace ? SDL_GetTicksNS() : 0;
 
         SDL_LockMutex(renderer->acquireCommandBufferLock);
 
         commandBuffer = METAL_INTERNAL_GetInactiveCommandBufferFromPool(renderer);
-        commandBuffer->handle = [renderer->queue commandBuffer];
+        METAL_INTERNAL_AfterglowAcquireNativeCommandBuffer(renderer, commandBuffer);
+        METAL_INTERNAL_AfterglowAcquirePassSamples(renderer, commandBuffer);
 
         commandBuffer->graphics_pipeline = NULL;
         commandBuffer->compute_pipeline = NULL;
@@ -2156,6 +3065,8 @@ static SDL_GPUCommandBuffer *METAL_AcquireCommandBuffer(
         }
 
         SDL_UnlockMutex(renderer->acquireCommandBufferLock);
+
+        if (trace) METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_ACQUIRE_COMMAND_BUFFER, SDL_GetTicksNS() - start);
 
         return (SDL_GPUCommandBuffer *)commandBuffer;
     }
@@ -2342,6 +3253,31 @@ static void METAL_BeginRenderPass(
             METAL_INTERNAL_TrackTexture(metalCommandBuffer, texture);
         }
 
+        metalCommandBuffer->afterglowActiveTimedPass = -1;
+        if (metalCommandBuffer->afterglowPassSampling) {
+            AfterglowMetalPassSamples *samples = metalCommandBuffer->afterglowPassSamples;
+            if (samples->passCount < AFTERGLOW_MAX_TIMED_PASSES) {
+                const Uint32 index = samples->passCount++;
+                metalCommandBuffer->afterglowActiveTimedPass = (Sint32)index;
+                if (numColorTargets > 0) {
+                    samples->passes[index].width = (Uint32)passDescriptor.colorAttachments[0].texture.width >> colorTargetInfos[0].mip_level;
+                    samples->passes[index].height = (Uint32)passDescriptor.colorAttachments[0].texture.height >> colorTargetInfos[0].mip_level;
+                } else if (depthStencilTargetInfo) {
+                    samples->passes[index].width = (Uint32)passDescriptor.depthAttachment.texture.width >> depthStencilTargetInfo->mip_level;
+                    samples->passes[index].height = (Uint32)passDescriptor.depthAttachment.texture.height >> depthStencilTargetInfo->mip_level;
+                }
+                if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+                    MTLRenderPassSampleBufferAttachmentDescriptor *attachment = passDescriptor.sampleBufferAttachments[0];
+                    attachment.sampleBuffer = samples->buffer;
+                    attachment.startOfVertexSampleIndex = index * 4;
+                    attachment.endOfVertexSampleIndex = index * 4 + 1;
+                    attachment.startOfFragmentSampleIndex = index * 4 + 2;
+                    attachment.endOfFragmentSampleIndex = index * 4 + 3;
+                }
+            } else {
+                samples->droppedPasses += 1;
+            }
+        }
         metalCommandBuffer->renderEncoder = [metalCommandBuffer->handle renderCommandEncoderWithDescriptor:passDescriptor];
 
         // The viewport cannot be larger than the smallest target.
@@ -2847,6 +3783,7 @@ static void METAL_DrawIndexedPrimitives(
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         SDL_GPUPrimitiveType primitiveType = metalCommandBuffer->graphics_pipeline->primitiveType;
         Uint32 indexSize = IndexSize(metalCommandBuffer->index_element_size);
+        METAL_INTERNAL_AfterglowRecordPassDraw(metalCommandBuffer, 1, (Uint64)numIndices * numInstances);
 
         METAL_INTERNAL_BindGraphicsResources(metalCommandBuffer);
 
@@ -2872,6 +3809,7 @@ static void METAL_DrawPrimitives(
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         SDL_GPUPrimitiveType primitiveType = metalCommandBuffer->graphics_pipeline->primitiveType;
+        METAL_INTERNAL_AfterglowRecordPassDraw(metalCommandBuffer, 1, (Uint64)numVertices * numInstances);
 
         METAL_INTERNAL_BindGraphicsResources(metalCommandBuffer);
 
@@ -2894,6 +3832,7 @@ static void METAL_DrawPrimitivesIndirect(
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         MetalBuffer *metalBuffer = ((MetalBufferContainer *)buffer)->activeBuffer;
         SDL_GPUPrimitiveType primitiveType = metalCommandBuffer->graphics_pipeline->primitiveType;
+        METAL_INTERNAL_AfterglowRecordPassDraw(metalCommandBuffer, drawCount, 0);
 
         METAL_INTERNAL_BindGraphicsResources(metalCommandBuffer);
 
@@ -2921,6 +3860,7 @@ static void METAL_DrawIndexedPrimitivesIndirect(
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         MetalBuffer *metalBuffer = ((MetalBufferContainer *)buffer)->activeBuffer;
         SDL_GPUPrimitiveType primitiveType = metalCommandBuffer->graphics_pipeline->primitiveType;
+        METAL_INTERNAL_AfterglowRecordPassDraw(metalCommandBuffer, drawCount, 0);
 
         METAL_INTERNAL_BindGraphicsResources(metalCommandBuffer);
 
@@ -2945,6 +3885,7 @@ static void METAL_EndRenderPass(
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         [metalCommandBuffer->renderEncoder endEncoding];
         metalCommandBuffer->renderEncoder = nil;
+        metalCommandBuffer->afterglowActiveTimedPass = -1;
 
         for (Uint32 i = 0; i < MAX_VERTEX_BUFFERS; i += 1) {
             metalCommandBuffer->vertexBuffers[i] = nil;
@@ -3505,6 +4446,11 @@ static void METAL_INTERNAL_CleanCommandBuffer(
     commandBuffer->needComputeReadOnlyStorageTextureBind = false;
     SDL_zeroa(commandBuffer->needComputeUniformBufferBind);
 
+    if (cancel && commandBuffer->afterglowPassSampling) {
+        SDL_SetAtomicInt(&commandBuffer->afterglowPassSamples->busy, 0);
+        commandBuffer->afterglowPassSampling = false;
+    }
+
     // Drop the command buffer's reference to the fence. A cancelled
     // command buffer never acquired one.
     if (!cancel) {
@@ -3596,13 +4542,39 @@ static bool METAL_WaitForFences(
 {
     @autoreleasepool {
         MetalRenderer *renderer = (MetalRenderer *)driverData;
+        const bool diagnose = renderer->afterglowDiagnosticsEnabled;
+        // AFTERGLOW TEMPORARY DIAGNOSTIC: negative uses the upstream blocking
+        // wait; zero polls, and positive values sleep between status polls.
+        // Read once per wait. The default preserves the upstream behavior.
+        const Sint64 requestedSleepNs = SDL_GetNumberProperty(
+            renderer->props, "afterglow.metal.fence_sleep_ns", -1);
+        const Uint64 sleepNs = requestedSleepNs > 0 ? (Uint64)requestedSleepNs : 0;
+        const Uint64 waitStart = diagnose ? SDL_GetTicksNS() : 0;
+        const Uint64 submission = diagnose && numFences > 0
+            ? ((MetalFence *)fences[0])->afterglowDiagnosticSubmission : 0;
+        const bool trace = METAL_INTERNAL_TimingActive(renderer);
+        Uint64 start = 0;
+        if (trace) {
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_FENCE_WAIT, true);
+            start = SDL_GetTicksNS();
+        }
 
         if (waitAll) {
             for (Uint32 i = 0; i < numFences; i += 1) {
                 MetalFence *fence = (MetalFence *)fences[i];
-                [fence->commandBuffer waitUntilCompleted];
+                if (requestedSleepNs < 0) {
+                    [fence->commandBuffer waitUntilCompleted];
+                } else {
+                    while (METAL_INTERNAL_IsFenceBusy(fence)) {
+                        if (sleepNs > 0) {
+                            SDL_DelayNS(sleepNs);
+                        }
+                    }
+                }
             }
         } else {
+            // Metal cannot attach completion handlers after submission, so
+            // upstream also polls when waiting for any fence, even in block mode.
             bool waiting = true;
             while (waiting) {
                 for (Uint32 i = 0; i < numFences; i += 1) {
@@ -3612,10 +4584,35 @@ static bool METAL_WaitForFences(
                         break;
                     }
                 }
+                if (waiting && sleepNs > 0) {
+                    SDL_DelayNS(sleepNs);
+                }
             }
         }
 
+        if (trace) {
+            METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_FENCE_WAIT, SDL_GetTicksNS() - start);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_FENCE_WAIT, false);
+        }
+
+        // Time only the fence wait, excluding pending-destroy cleanup and
+        // this diagnostic's own logging cost.
+        if (diagnose) {
+            const Uint64 waitEnd = SDL_GetTicksNS();
+            if (waitEnd - waitStart > 12000000ULL) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/fence_wait submission=%" SDL_PRIu64
+                    " start_ns=%" SDL_PRIu64 " end_ns=%" SDL_PRIu64
+                    " wait_ms=%.3f fences=%u all=%d",
+                    submission, waitStart, waitEnd,
+                    (double)(waitEnd - waitStart) / 1000000.0,
+                    numFences, waitAll);
+            }
+        }
+
+        if (trace) start = SDL_GetTicksNS();
         METAL_INTERNAL_PerformPendingDestroys(renderer);
+        if (trace) METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_FENCE_CLEANUP, SDL_GetTicksNS() - start);
 
         return true;
     }
@@ -3863,7 +4860,7 @@ static bool METAL_WaitForSwapchain(
     }
 }
 
-static bool METAL_INTERNAL_AcquireSwapchainTexture(
+static bool METAL_INTERNAL_AcquireSwapchainTextureImpl(
     bool block,
     SDL_GPUCommandBuffer *commandBuffer,
     SDL_Window *window,
@@ -3876,6 +4873,8 @@ static bool METAL_INTERNAL_AcquireSwapchainTexture(
         MetalRenderer *renderer = metalCommandBuffer->renderer;
         MetalWindowData *windowData;
         CGSize drawableSize;
+        const bool diagnose = renderer->afterglowDiagnosticsEnabled;
+        Uint64 previousSubmission = 0;
 
         *texture = NULL;
         if (swapchainTextureWidth) {
@@ -3902,6 +4901,10 @@ static bool METAL_INTERNAL_AcquireSwapchainTexture(
         }
 
         if (windowData->inFlightFences[windowData->frameCounter] != NULL) {
+            if (diagnose) {
+                previousSubmission = ((MetalFence *)windowData->inFlightFences[
+                    windowData->frameCounter])->afterglowDiagnosticSubmission;
+            }
             if (block) {
                 // If we are blocking, just wait for the fence!
                 if (!METAL_WaitForFences(
@@ -3929,7 +4932,28 @@ static bool METAL_INTERNAL_AcquireSwapchainTexture(
         }
 
         // Get the drawable and its underlying texture
+        const bool trace = METAL_INTERNAL_TimingActive(renderer);
+        if (trace) {
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_NEXT_DRAWABLE, true);
+        }
+        const Uint64 drawableStart = (diagnose || trace) ? SDL_GetTicksNS() : 0;
         windowData->drawable = [windowData->layer nextDrawable];
+        if (trace) {
+            METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_NEXT_DRAWABLE, SDL_GetTicksNS() - drawableStart);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_NEXT_DRAWABLE, false);
+        }
+        if (diagnose) {
+            const Uint64 drawableEnd = SDL_GetTicksNS();
+            if (drawableEnd - drawableStart > 12000000ULL) {
+                SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/next_drawable previous_submission=%" SDL_PRIu64
+                    " start_ns=%" SDL_PRIu64 " end_ns=%" SDL_PRIu64
+                    " wait_ms=%.3f block=%d drawable=%d",
+                    previousSubmission, drawableStart, drawableEnd,
+                    (double)(drawableEnd - drawableStart) / 1000000.0,
+                    block, windowData->drawable != nil);
+            }
+        }
         windowData->texture.handle = [windowData->drawable texture];
 
         // Set up presentation
@@ -3946,6 +4970,18 @@ static bool METAL_INTERNAL_AcquireSwapchainTexture(
         *texture = (SDL_GPUTexture *)&windowData->textureContainer;
         return true;
     }
+}
+
+static bool METAL_INTERNAL_AcquireSwapchainTexture(
+    bool block, SDL_GPUCommandBuffer *commandBuffer, SDL_Window *window,
+    SDL_GPUTexture **texture, Uint32 *width, Uint32 *height)
+{
+    MetalRenderer *renderer = ((MetalCommandBuffer *)commandBuffer)->renderer;
+    const bool trace = METAL_INTERNAL_TimingActive(renderer);
+    const Uint64 start = trace ? SDL_GetTicksNS() : 0;
+    const bool result = METAL_INTERNAL_AcquireSwapchainTextureImpl(block, commandBuffer, window, texture, width, height);
+    if (trace) METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_ACQUIRE_SWAPCHAIN, SDL_GetTicksNS() - start);
+    return result;
 }
 
 static bool METAL_AcquireSwapchainTexture(
@@ -4056,25 +5092,77 @@ static bool METAL_SetAllowedFramesInFlight(
         }
 
         renderer->allowedFramesInFlight = allowedFramesInFlight;
+        SDL_SetNumberProperty(renderer->props,
+            "afterglow.metal.frames_in_flight", allowedFramesInFlight);
         return true;
     }
 }
 
 // Submission
 
-static bool METAL_INTERNAL_Submit(
+static bool METAL_SubmitImpl(
     SDL_GPUCommandBuffer *commandBuffer,
     SDL_GPUFence **fence)
 {
     @autoreleasepool {
         MetalCommandBuffer *metalCommandBuffer = (MetalCommandBuffer *)commandBuffer;
         MetalRenderer *renderer = metalCommandBuffer->renderer;
+        const bool trace = METAL_INTERNAL_TimingActive(renderer);
+        Uint64 start = 0;
 
+        if (trace) {
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_SUBMIT_LOCK, true);
+            start = SDL_GetTicksNS();
+        }
         SDL_LockMutex(renderer->submitLock);
+        if (trace) {
+            METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_SUBMIT_LOCK, SDL_GetTicksNS() - start);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_SUBMIT_LOCK, false);
+        }
 
         if (!METAL_INTERNAL_AcquireFence(renderer, metalCommandBuffer)) {
+            if (metalCommandBuffer->afterglowPassSampling) {
+                SDL_SetAtomicInt(&metalCommandBuffer->afterglowPassSamples->busy, 0);
+                metalCommandBuffer->afterglowPassSampling = false;
+            }
             SDL_UnlockMutex(renderer->submitLock);
             return false;
+        }
+
+        const bool diagnose = renderer->afterglowDiagnosticsEnabled;
+        const Uint64 diagnosticSubmission = (diagnose || renderer->afterglowPresentations)
+            ? ++renderer->afterglowDiagnosticSubmission : 0;
+        metalCommandBuffer->fence->afterglowDiagnosticSubmission =
+            diagnosticSubmission;
+
+        // AFTERGLOW TEMPORARY DIAGNOSTIC: sample on the main thread at most
+        // once per second, logging only the first sample or a state change.
+        // This runs under submitLock and never from a completion handler.
+        if (diagnose && SDL_IsMainThread()) {
+            const Uint64 now = SDL_GetTicksNS();
+            if (now >= renderer->afterglowNextThermalSampleNS) {
+                renderer->afterglowNextThermalSampleNS = now + 1000000000ULL;
+                NSProcessInfo *processInfo = [NSProcessInfo processInfo];
+                const Sint32 thermal = (Sint32)processInfo.thermalState;
+                Sint32 lowPower = -1;
+                if (@available(macOS 12.0, iOS 9.0, tvOS 9.0, *)) {
+                    lowPower = processInfo.lowPowerModeEnabled ? 1 : 0;
+                }
+                if (thermal != renderer->afterglowThermalState ||
+                    lowPower != renderer->afterglowLowPowerModeState) {
+                    static const char *thermalNames[] = {
+                        "nominal", "fair", "serious", "critical"
+                    };
+                    SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                        "AfterglowMetal/thermal submission=%" SDL_PRIu64
+                        " ticks_ns=%" SDL_PRIu64 " state=%d name=%s low_power=%d",
+                        diagnosticSubmission, now, thermal,
+                        thermal >= 0 && thermal < 4 ? thermalNames[thermal] : "unknown",
+                        lowPower);
+                    renderer->afterglowThermalState = thermal;
+                    renderer->afterglowLowPowerModeState = lowPower;
+                }
+            }
         }
 
         // Give the caller its own reference while submitLock is held, another
@@ -4087,7 +5175,22 @@ static bool METAL_INTERNAL_Submit(
         // Enqueue present requests, if applicable
         for (Uint32 i = 0; i < metalCommandBuffer->windowDataCount; i += 1) {
             MetalWindowData *windowData = metalCommandBuffer->windowDatas[i];
+            if (renderer->afterglowPresentations) {
+                if (windowData->afterglowPresentationLayer == 0) {
+                    windowData->afterglowPresentationLayer = ++renderer->afterglowNextPresentationLayer;
+                }
+                METAL_INTERNAL_AfterglowRecordPresentation(renderer->afterglowPresentations,
+                    windowData->drawable, diagnosticSubmission, windowData->afterglowPresentationLayer);
+            }
+            if (trace) {
+                METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_PRESENT_DRAWABLE, true);
+                start = SDL_GetTicksNS();
+            }
             [metalCommandBuffer->handle presentDrawable:windowData->drawable];
+            if (trace) {
+                METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_PRESENT_DRAWABLE, SDL_GetTicksNS() - start);
+                METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_PRESENT_DRAWABLE, false);
+            }
             windowData->drawable = nil;
 
             windowData->inFlightFences[windowData->frameCounter] = (SDL_GPUFence *)metalCommandBuffer->fence;
@@ -4097,9 +5200,74 @@ static bool METAL_INTERNAL_Submit(
             windowData->frameCounter = (windowData->frameCounter + 1) % renderer->allowedFramesInFlight;
         }
 
+        // AFTERGLOW TEMPORARY DIAGNOSTICS: capture only immutable scalars.
+        // Native command-buffer status now drives fence completion. SDL's
+        // command buffer, renderer, window, and fence may already be recycled
+        // or destroyed when this callback runs; never access them here.
+        const Uint64 submitStart = diagnose ? SDL_GetTicksNS() : 0;
+        const Uint32 presentCount = metalCommandBuffer->windowDataCount;
+        const Uint64 diagnosticSampleInterval = renderer->afterglowDiagnosticSampleInterval;
+        if (diagnose) {
+            [metalCommandBuffer->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+              const Uint64 completeTime = SDL_GetTicksNS();
+              CFTimeInterval gpuStart = 0.0, gpuEnd = 0.0;
+              CFTimeInterval kernelStart = 0.0, kernelEnd = 0.0;
+              if (@available(macOS 10.15, iOS 10.3, tvOS 10.3, *)) {
+                  gpuStart = buffer.GPUStartTime;
+                  gpuEnd = buffer.GPUEndTime;
+                  kernelStart = buffer.kernelStartTime;
+                  kernelEnd = buffer.kernelEndTime;
+              }
+              const int status = (int)buffer.status;
+              const double gpuMs = gpuStart > 0.0 && gpuEnd >= gpuStart
+                  ? (gpuEnd - gpuStart) * 1000.0 : -1.0;
+              const double kernelMs = kernelStart > 0.0 && kernelEnd >= kernelStart
+                  ? (kernelEnd - kernelStart) * 1000.0 : -1.0;
+              const double wallMs = (double)(completeTime - submitStart) / 1000000.0;
+              if (gpuMs > 12.0 || kernelMs > 12.0 || wallMs > 12.0 ||
+                  (diagnosticSampleInterval > 0 && diagnosticSubmission % diagnosticSampleInterval == 0)) {
+                  SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                      "AfterglowMetal/completed submission=%" SDL_PRIu64
+                      " submit_ns=%" SDL_PRIu64 " complete_ns=%" SDL_PRIu64
+                      " wall_ms=%.3f gpu_ms=%.3f kernel_ms=%.3f"
+                      " gpu_start_s=%.6f gpu_end_s=%.6f"
+                      " kernel_start_s=%.6f kernel_end_s=%.6f presents=%u status=%d",
+                      diagnosticSubmission, submitStart, completeTime,
+                      wallMs, gpuMs, kernelMs, gpuStart, gpuEnd,
+                      kernelStart, kernelEnd, presentCount, status);
+              }
+            }];
+        }
+
+        if (metalCommandBuffer->afterglowPassSampling) {
+            AfterglowMetalPassSamples *samples = metalCommandBuffer->afterglowPassSamples;
+            const bool logPeriodic = renderer->afterglowPassTimestampMode == 1 ||
+                diagnosticSubmission % 30 == 0;
+            [metalCommandBuffer->handle addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+                METAL_INTERNAL_AfterglowCompletePassSamples(samples, buffer, diagnosticSubmission, logPeriodic);
+            }];
+            // The retained native owner, not this wrapper, now owns the lease.
+            metalCommandBuffer->afterglowPassSampling = false;
+        }
+
         // Submit the command buffer
+        if (trace) {
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_COMMIT, true);
+            start = SDL_GetTicksNS();
+        }
         [metalCommandBuffer->handle commit];
+        if (trace) {
+            METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_COMMIT, SDL_GetTicksNS() - start);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_COMMIT, false);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_SUBMIT_CLEANUP, true);
+            start = SDL_GetTicksNS();
+        }
         metalCommandBuffer->handle = nil;
+        if (metalCommandBuffer->windowDataCount > 0 &&
+            metalCommandBuffer->afterglowCaptureGeneration != 0) {
+            METAL_INTERNAL_AfterglowStopCapture(
+                renderer, metalCommandBuffer->afterglowCaptureGeneration);
+        }
 
         // Mark the command buffer as submitted
         if (renderer->submittedCommandBufferCount >= renderer->submittedCommandBufferCapacity) {
@@ -4126,8 +5294,25 @@ static bool METAL_INTERNAL_Submit(
 
         SDL_UnlockMutex(renderer->submitLock);
 
+        if (trace) {
+            METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_SUBMIT_CLEANUP, SDL_GetTicksNS() - start);
+            METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_SUBMIT_CLEANUP, false);
+        }
+
         return true;
     }
+}
+
+static bool METAL_INTERNAL_Submit(
+    SDL_GPUCommandBuffer *commandBuffer,
+    SDL_GPUFence **fence)
+{
+    MetalRenderer *renderer = ((MetalCommandBuffer *)commandBuffer)->renderer;
+    const bool trace = METAL_INTERNAL_TimingActive(renderer);
+    const Uint64 start = trace ? SDL_GetTicksNS() : 0;
+    const bool result = METAL_SubmitImpl(commandBuffer, fence);
+    if (trace) METAL_INTERNAL_TimingAdd(renderer, SDL_ACCELERANDO_GPU_SUBMIT, SDL_GetTicksNS() - start);
+    return result;
 }
 
 static bool METAL_Submit(
@@ -4594,6 +5779,18 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
             SDL_LogInfo(SDL_LOG_CATEGORY_GPU, "SDL_GPU Driver: Metal");
         }
 
+        // Expose raw Metal handles for platform-specific features (MetalFX, etc.).
+        // These are intentionally __bridge (non-retained) pointers; their lifetime
+        // is owned by the MetalRenderer struct. Apps must not release them.
+        SDL_SetPointerProperty(
+            renderer->props,
+            "SDL.gpu.device.metal.device",
+            (__bridge void *)device);
+        SDL_SetPointerProperty(
+            renderer->props,
+            "SDL.gpu.device.metal.command_queue",
+            (__bridge void *)renderer->queue);
+
         // Record device name
         const char *deviceName = [device.name UTF8String];
         SDL_SetStringProperty(
@@ -4606,7 +5803,65 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
 
         // Remember debug mode
         renderer->debugMode = debugMode;
+        const char *afterglowDiagnostics = SDL_getenv("AFTERGLOW_METAL_DIAGNOSTICS");
+        renderer->afterglowDiagnosticsEnabled = afterglowDiagnostics != NULL &&
+            SDL_strcmp(afterglowDiagnostics, "1") == 0;
+        renderer->afterglowDiagnosticSampleInterval = 0;
+        renderer->afterglowThermalState = -1;
+        renderer->afterglowLowPowerModeState = -1;
+        if (renderer->afterglowDiagnosticsEnabled) {
+            const char *sampleInterval = SDL_getenv("AFTERGLOW_METAL_SAMPLE_INTERVAL");
+            if (sampleInterval != NULL && sampleInterval[0] >= '0' && sampleInterval[0] <= '9') {
+                char *end = NULL;
+                const Uint64 interval = SDL_strtoull(sampleInterval, &end, 10);
+                if (interval > 0 && end != NULL && *end == '\0') {
+                    renderer->afterglowDiagnosticSampleInterval = interval;
+                }
+            }
+            const char *passMode = SDL_getenv("AFTERGLOW_METAL_PASS_TIMESTAMPS");
+            if (passMode && (SDL_strcmp(passMode, "1") == 0 || SDL_strcmp(passMode, "2") == 0)) {
+                if (@available(macOS 11.0, iOS 14.0, tvOS 14.0, *)) {
+                    if ([device supportsCounterSampling:MTLCounterSamplingPointAtStageBoundary]) {
+                        for (id<MTLCounterSet> set in device.counterSets) {
+                            if ([set.name isEqualToString:MTLCommonCounterSetTimestamp]) {
+                                for (id<MTLCounter> counter in set.counters) {
+                                    if ([counter.name isEqualToString:MTLCommonCounterTimestamp]) {
+                                        renderer->afterglowTimestampCounterSet = set;
+                                        renderer->afterglowPassTimestampMode = (Uint32)(passMode[0] - '0');
+                                        break;
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+                SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                    "AfterglowMetal/pass_timestamps enabled=%u requested=%s max_passes=%u samples=%u"
+                    " cadence=%s timing_includes_counter_overhead=1",
+                    renderer->afterglowPassTimestampMode, passMode, AFTERGLOW_MAX_TIMED_PASSES,
+                    AFTERGLOW_MAX_TIMED_PASSES * 4,
+                    renderer->afterglowPassTimestampMode == 2 ? "all_native_buffers" : "every_30th_native_buffer");
+            }
+        }
         renderer->allowedFramesInFlight = 2;
+        SDL_SetNumberProperty(renderer->props,
+            "afterglow.metal.frames_in_flight", renderer->allowedFramesInFlight);
+
+        const char *timing = SDL_getenv("ACCEL_METAL_DIAGNOSTICS");
+        renderer->timingEnabled = timing && SDL_strcmp(timing, "1") == 0;
+        if (renderer->timingEnabled) {
+            renderer->timingOwner = SDL_GetCurrentThreadID();
+            const char *signposts = SDL_getenv("ACCEL_METAL_SIGNPOSTS");
+            if (signposts && SDL_strcmp(signposts, "1") == 0) {
+                if (@available(macOS 10.14, iOS 12.0, tvOS 12.0, *)) {
+                    renderer->timingLog = os_log_create("com.vectorbreach.accelerando", "SDL Metal phases");
+                    renderer->timingSignpostID = os_signpost_id_generate(renderer->timingLog);
+                    renderer->timingSignposts = true;
+                }
+            }
+            SDL_SetPointerProperty(renderer->props, SDL_PROP_GPU_ACCELERANDO_TIMING_POINTER, (void *)&metalTimingAPI);
+        }
 
         // Set up colorspace array
         SwapchainCompositionToColorSpace[0] = kCGColorSpaceSRGB;
@@ -4625,6 +5880,23 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         renderer->disposeLock = SDL_CreateMutex();
         renderer->fenceLock = SDL_CreateMutex();
         renderer->windowLock = SDL_CreateMutex();
+        if (renderer->afterglowDiagnosticsEnabled) {
+            renderer->afterglowCaptureLock = SDL_CreateMutex();
+            bool captureSupported = false;
+            if (@available(macOS 10.15, iOS 13.0, tvOS 13.0, *)) {
+                captureSupported = [[MTLCaptureManager sharedCaptureManager]
+                    supportsDestination:MTLCaptureDestinationGPUTraceDocument];
+            }
+            SDL_SetBooleanProperty(renderer->props,
+                "afterglow.metal.capture_enabled", renderer->afterglowCaptureLock != NULL);
+            SDL_SetBooleanProperty(renderer->props,
+                "afterglow.metal.capture_supported", captureSupported);
+            SDL_SetStringProperty(renderer->props, "afterglow.metal.capture_status",
+                renderer->afterglowCaptureLock ? "idle" : "error: capture mutex creation failed");
+            SDL_LogInfo(SDL_LOG_CATEGORY_GPU,
+                "AfterglowMetal/capture available=%d supported=%d",
+                renderer->afterglowCaptureLock != NULL, captureSupported);
+        }
 
         // Create command buffer pool
         METAL_INTERNAL_AllocateCommandBuffers(renderer, 2);
@@ -4670,9 +5942,66 @@ static SDL_GPUDevice *METAL_CreateDevice(bool debugMode, bool preferLowPower, SD
         result->driverData = (SDL_GPURenderer *)renderer;
         result->shader_formats = SDL_GPU_SHADERFORMAT_MSL | SDL_GPU_SHADERFORMAT_METALLIB;
         renderer->sdlGPUDevice = result;
+        renderer->afterglowPresentations = METAL_INTERNAL_AfterglowCreatePresentations();
 
         return result;
     }
+}
+
+// AFTERGLOW LOCAL PATCH: expose the active native Metal texture used by an
+// SDL GPU texture for platform post-processing. Query after rendering so a
+// cycled texture returns the slot containing the current content.
+void *SDL_GetGPUTextureMetalHandle(SDL_GPUTexture *texture)
+{
+    if (texture == NULL) {
+        return NULL;
+    }
+    @autoreleasepool {
+        MetalTextureContainer *container = (MetalTextureContainer *)texture;
+        if (container->activeTexture == NULL) {
+            return NULL;
+        }
+        return (__bridge void *)container->activeTexture->handle;
+    }
+}
+
+// COUNTERPOINT LOCAL PATCH: append a native texture effect between SDL GPU
+// passes. Track active backings exactly like a normal SDL pass, including
+// deferred destruction. No cycling: the shared queue orders writes after
+// every earlier consumer, and Metal's tracked private textures order hazards.
+// The callback may encode only, never submit, wait, or leave an encoder open.
+bool SDL_EncodeGPUTextureMetalInterop(SDL_GPUCommandBuffer *commandBuffer,
+                                     SDL_GPUTexture *input,
+                                     SDL_GPUTexture *output,
+                                     void (*encode)(void *, void *, void *, void *),
+                                     void *userdata)
+{
+    if (commandBuffer == NULL || input == NULL || output == NULL || encode == NULL) {
+        return SDL_InvalidParamError("Metal interop arguments");
+    }
+    CommandBufferCommonHeader *common = (CommandBufferCommonHeader *)commandBuffer;
+    if (SDL_strcmp(SDL_GetGPUDeviceDriver(common->device), "metal") != 0) {
+        return SDL_SetError("Metal interop requires a Metal command buffer");
+    }
+    @autoreleasepool {
+        MetalCommandBuffer *commands = (MetalCommandBuffer *)commandBuffer;
+        // CommonHeader validation fields are reset only for debug devices.
+        // In release, submitted can remain true after a pooled buffer is
+        // reacquired. Native status and encoder handles are always current.
+        if (commands->handle == nil ||
+            commands->handle.status >= MTLCommandBufferStatusCommitted ||
+            commands->renderEncoder != nil || commands->blitEncoder != nil ||
+            commands->computeEncoder != nil) {
+            return SDL_SetError("Metal interop requires an idle, unsubmitted Metal command buffer");
+        }
+        MetalTexture *source = ((MetalTextureContainer *)input)->activeTexture;
+        MetalTexture *destination = ((MetalTextureContainer *)output)->activeTexture;
+        METAL_INTERNAL_TrackTexture(commands, source);
+        METAL_INTERNAL_TrackTexture(commands, destination);
+        encode(userdata, (__bridge void *)commands->handle,
+               (__bridge void *)source->handle, (__bridge void *)destination->handle);
+    }
+    return true;
 }
 
 SDL_GPUBootstrap MetalDriver = {

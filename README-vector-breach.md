@@ -69,7 +69,8 @@ same source for native SDL and `org.libsdl.app` Java. Build output belongs in
 each consumer's build directory, outside this checkout.
 
 Before promoting an SDL change, build and run the native suites in all three
-games. Include Counterpoint's GPU uniform snapshot regression and Accelerando's
+games. Run the fork's [GPU fence regression](test/README-vector-breach.md),
+including both validation modes. Include Counterpoint's GPU uniform snapshot regression and Accelerando's
 GPU render target checks. Run the consumer mobile/package CI for changes to
 platform code or dependency wiring. Record skipped platforms and missing
 fixtures; passing desktop tests does not establish mobile or pacing readiness.

@@ -1,3 +1,7 @@
+**Vector Breach shared fork:** Accelerando, Afterglow, and Counterpoint use one
+common revision maintained here. See [the fork maintenance guide](README-vector-breach.md)
+for changes, provenance, development, and coordinated updates. This is an altered
+SDL distribution; the upstream project is [libsdl-org/SDL](https://github.com/libsdl-org/SDL).
 
 Simple DirectMedia Layer (SDL for short) is a cross-platform library
 designed to make it easy to write multi-media software, such as games

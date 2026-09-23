@@ -128,7 +128,19 @@ typedef struct SDL_GPURenderStateUniformBuffer
     Uint32 slot_index;
     void *data;
     Uint32 length;
+    Uint32 capacity;
 } SDL_GPURenderStateUniformBuffer;
+
+// SDL_GPU exposes four uniform-buffer slots per shader stage. Render commands
+// retain offsets into the renderer-owned snapshot arena so changing a custom
+// state's uniforms does not have to flush every command queued before it.
+#define SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS 4
+typedef struct SDL_GPURenderStateUniformSnapshot
+{
+    Uint32 slot_index;
+    Uint32 length;
+    size_t data_offset;
+} SDL_GPURenderStateUniformSnapshot;
 
 // Define the GPU render state structure
 struct SDL_GPURenderState
@@ -149,7 +161,12 @@ struct SDL_GPURenderState
     SDL_GPUBuffer **storage_buffers;
 
     int num_uniform_buffers;
-    SDL_GPURenderStateUniformBuffer *uniform_buffers;
+    SDL_GPURenderStateUniformBuffer uniform_buffers[SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS];
+    Uint64 uniform_generation;
+    Uint64 snapshot_uniform_generation;
+    Uint64 snapshot_epoch;
+    int num_snapshot_uniform_buffers;
+    SDL_GPURenderStateUniformSnapshot snapshot_uniform_buffers[SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS];
 };
 
 typedef enum
@@ -194,6 +211,9 @@ typedef struct SDL_RenderCommand
             SDL_TextureAddressMode texture_address_mode_u;
             SDL_TextureAddressMode texture_address_mode_v;
             SDL_GPURenderState *gpu_render_state;
+            Uint64 gpu_render_state_uniform_generation;
+            int num_gpu_render_state_uniform_buffers;
+            SDL_GPURenderStateUniformSnapshot gpu_render_state_uniform_buffers[SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS];
         } draw;
         struct
         {
@@ -345,6 +365,10 @@ struct SDL_Renderer
     void *vertex_data;
     size_t vertex_data_used;
     size_t vertex_data_allocation;
+    void *gpu_render_state_uniform_data;
+    size_t gpu_render_state_uniform_data_used;
+    size_t gpu_render_state_uniform_data_allocation;
+    Uint64 gpu_render_state_uniform_snapshot_epoch;
 
     // Shaped window support
     bool transparent_window;
@@ -417,6 +441,14 @@ extern SDL_BlendOperation SDL_GetBlendModeAlphaOperation(SDL_BlendMode blendMode
    for a vertex buffer during RunCommandQueue(). Pointers returned here are only valid until
    the next call, because it might be in an array that gets realloc()'d. */
 extern void *SDL_AllocateRenderVertices(SDL_Renderer *renderer, size_t numbytes, size_t alignment, size_t *offset);
+
+// Snapshot mutable custom-render-state uniforms into command-owned metadata.
+// The byte storage remains renderer-owned until the command queue is consumed.
+extern bool SDL_SnapshotGPURenderStateUniforms(SDL_Renderer *renderer, SDL_RenderCommand *cmd);
+
+// Draw commands may only be combined when both the custom render state and
+// the immutable uniform snapshot selected for the command are identical.
+extern bool SDL_RenderCommandsHaveSameGPURenderState(const SDL_RenderCommand *a, const SDL_RenderCommand *b);
 
 // Let the video subsystem destroy a renderer without making its pointer invalid.
 extern void SDL_DestroyRendererWithoutFreeing(SDL_Renderer *renderer);

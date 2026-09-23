@@ -920,6 +920,7 @@ SDL3_0.0.0 {
     SDL_StorageReady;
     SDL_StringToGUID;
     SDL_SubmitGPUCommandBuffer;
+    SDL_SubmitGPURendererCommandsForInterop;
     SDL_SubmitGPUCommandBufferAndAcquireFence;
     SDL_SurfaceHasAlternateImages;
     SDL_SurfaceHasColorKey;

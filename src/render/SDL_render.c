@@ -315,6 +315,7 @@ static bool FlushRenderCommands(SDL_Renderer *renderer)
 
     if (!renderer->render_commands) { // nothing to do!
         SDL_assert(renderer->vertex_data_used == 0);
+        SDL_assert(renderer->gpu_render_state_uniform_data_used == 0);
         return true;
     }
 
@@ -336,6 +337,8 @@ static bool FlushRenderCommands(SDL_Renderer *renderer)
         renderer->render_commands = NULL;
     }
     renderer->vertex_data_used = 0;
+    renderer->gpu_render_state_uniform_data_used = 0;
+    renderer->gpu_render_state_uniform_snapshot_epoch++;
     renderer->render_command_generation++;
     renderer->color_queued = false;
     renderer->viewport_queued = false;
@@ -439,6 +442,89 @@ static SDL_RenderCommand *AllocateRenderCommand(SDL_Renderer *renderer)
     renderer->render_commands_tail = result;
 
     return result;
+}
+
+bool SDL_SnapshotGPURenderStateUniforms(SDL_Renderer *renderer, SDL_RenderCommand *cmd)
+{
+    SDL_GPURenderState *state = renderer->gpu_render_state;
+
+    cmd->data.draw.gpu_render_state = state;
+    cmd->data.draw.gpu_render_state_uniform_generation = 0;
+    cmd->data.draw.num_gpu_render_state_uniform_buffers = 0;
+    if (!state) {
+        return true;
+    }
+
+    if (state->num_uniform_buffers == 0) {
+        state->last_command_generation = renderer->render_command_generation;
+        return true;
+    }
+
+    if (state->num_uniform_buffers < 0 ||
+        state->num_uniform_buffers > SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS) {
+        return SDL_SetError("GPU render state has an invalid uniform-buffer count");
+    }
+    if (state->snapshot_epoch != renderer->gpu_render_state_uniform_snapshot_epoch ||
+        state->snapshot_uniform_generation != state->uniform_generation) {
+        const size_t used_before_snapshot = renderer->gpu_render_state_uniform_data_used;
+        for (int i = 0; i < state->num_uniform_buffers; ++i) {
+            const SDL_GPURenderStateUniformBuffer *source = &state->uniform_buffers[i];
+            SDL_GPURenderStateUniformSnapshot *snapshot = &state->snapshot_uniform_buffers[i];
+            const size_t storage_length = SDL_max((size_t)source->length, (size_t)1);
+            if (storage_length > (SIZE_MAX - renderer->gpu_render_state_uniform_data_used)) {
+                renderer->gpu_render_state_uniform_data_used = used_before_snapshot;
+                return SDL_SetError("GPU render state uniform snapshot is too large");
+            }
+            const size_t needed = renderer->gpu_render_state_uniform_data_used + storage_length;
+            if (needed > renderer->gpu_render_state_uniform_data_allocation) {
+                size_t allocation = renderer->gpu_render_state_uniform_data_allocation;
+                if (allocation == 0) {
+                    allocation = 1024;
+                }
+                while (allocation < needed) {
+                    if (allocation > (SIZE_MAX / 2)) {
+                        allocation = needed;
+                        break;
+                    }
+                    allocation *= 2;
+                }
+                void *data = SDL_realloc(renderer->gpu_render_state_uniform_data, allocation);
+                if (!data) {
+                    renderer->gpu_render_state_uniform_data_used = used_before_snapshot;
+                    return false;
+                }
+                renderer->gpu_render_state_uniform_data = data;
+                renderer->gpu_render_state_uniform_data_allocation = allocation;
+            }
+
+            snapshot->slot_index = source->slot_index;
+            snapshot->length = source->length;
+            snapshot->data_offset = renderer->gpu_render_state_uniform_data_used;
+            SDL_memcpy((Uint8 *)renderer->gpu_render_state_uniform_data + snapshot->data_offset,
+                       source->data, source->length);
+            if (source->length == 0) {
+                *((Uint8 *)renderer->gpu_render_state_uniform_data + snapshot->data_offset) = 0;
+            }
+            renderer->gpu_render_state_uniform_data_used = needed;
+        }
+        state->num_snapshot_uniform_buffers = state->num_uniform_buffers;
+        state->snapshot_epoch = renderer->gpu_render_state_uniform_snapshot_epoch;
+        state->snapshot_uniform_generation = state->uniform_generation;
+    }
+
+    cmd->data.draw.gpu_render_state_uniform_generation = state->uniform_generation;
+    cmd->data.draw.num_gpu_render_state_uniform_buffers = state->num_snapshot_uniform_buffers;
+    SDL_memcpy(cmd->data.draw.gpu_render_state_uniform_buffers,
+               state->snapshot_uniform_buffers,
+               (size_t)state->num_snapshot_uniform_buffers * sizeof(state->snapshot_uniform_buffers[0]));
+    state->last_command_generation = renderer->render_command_generation;
+    return true;
+}
+
+bool SDL_RenderCommandsHaveSameGPURenderState(const SDL_RenderCommand *a, const SDL_RenderCommand *b)
+{
+    return a->data.draw.gpu_render_state == b->data.draw.gpu_render_state &&
+           a->data.draw.gpu_render_state_uniform_generation == b->data.draw.gpu_render_state_uniform_generation;
 }
 
 static void UpdatePixelViewport(SDL_Renderer *renderer, SDL_RenderViewState *view)
@@ -604,9 +690,9 @@ static SDL_RenderCommand *PrepQueueCmdDraw(SDL_Renderer *renderer, const SDL_Ren
             }
             cmd->data.draw.texture_address_mode_u = SDL_TEXTURE_ADDRESS_CLAMP;
             cmd->data.draw.texture_address_mode_v = SDL_TEXTURE_ADDRESS_CLAMP;
-            cmd->data.draw.gpu_render_state = renderer->gpu_render_state;
-            if (renderer->gpu_render_state) {
-                renderer->gpu_render_state->last_command_generation = renderer->render_command_generation;
+            if (!SDL_SnapshotGPURenderStateUniforms(renderer, cmd)) {
+                cmd->command = SDL_RENDERCMD_NO_OP;
+                cmd = NULL;
             }
         }
     }
@@ -5633,6 +5719,8 @@ static void SDL_DiscardAllCommands(SDL_Renderer *renderer)
     renderer->render_commands_tail = NULL;
     renderer->render_commands = NULL;
     renderer->vertex_data_used = 0;
+    renderer->gpu_render_state_uniform_data_used = 0;
+    renderer->gpu_render_state_uniform_snapshot_epoch++;
 
     while (cmd) {
         SDL_RenderCommand *next = cmd->next;
@@ -5695,6 +5783,10 @@ void SDL_DestroyRendererWithoutFreeing(SDL_Renderer *renderer)
     if (renderer->vertex_data) {
         SDL_free(renderer->vertex_data);
         renderer->vertex_data = NULL;
+    }
+    if (renderer->gpu_render_state_uniform_data) {
+        SDL_free(renderer->gpu_render_state_uniform_data);
+        renderer->gpu_render_state_uniform_data = NULL;
     }
     if (renderer->texture_formats) {
         SDL_free(renderer->texture_formats);
@@ -6117,6 +6209,7 @@ SDL_GPURenderState *SDL_CreateGPURenderState(SDL_Renderer *renderer, const SDL_G
 
     state->renderer = renderer;
     state->fragment_shader = createinfo->fragment_shader;
+    state->uniform_generation = 1;
 
     if (createinfo->num_sampler_bindings > 0) {
         state->sampler_bindings = (SDL_GPUTextureSamplerBinding *)SDL_calloc(createinfo->num_sampler_bindings, sizeof(*state->sampler_bindings));
@@ -6156,42 +6249,53 @@ bool SDL_SetGPURenderStateFragmentUniforms(SDL_GPURenderState *state, Uint32 slo
     if (!state) {
         return SDL_InvalidParamError("state");
     }
-
-    if (!FlushRenderCommandsIfGPURenderStateNeeded(state)) {
-        return false;
+    if (!data) {
+        return SDL_InvalidParamError("data");
+    }
+    if (slot_index >= SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS) {
+        return SDL_SetError("slot_index exceeds the GPU uniform-buffer slot limit");
     }
 
     for (int i = 0; i < state->num_uniform_buffers; i++) {
         SDL_GPURenderStateUniformBuffer *buffer = &state->uniform_buffers[i];
         if (buffer->slot_index == slot_index) {
-            void *new_data = SDL_realloc(buffer->data, length);
-            if (!new_data) {
-                return false;
+            if (length > buffer->capacity) {
+                void *new_data = SDL_realloc(buffer->data, length);
+                if (!new_data) {
+                    return false;
+                }
+                buffer->data = new_data;
+                buffer->capacity = length;
             }
-            SDL_memcpy(new_data, data, length);
-            buffer->data = new_data;
+            SDL_memcpy(buffer->data, data, length);
             buffer->length = length;
+            if (++state->uniform_generation == 0) {
+                ++state->uniform_generation;
+            }
             return true;
         }
     }
 
-    SDL_GPURenderStateUniformBuffer *buffers = (SDL_GPURenderStateUniformBuffer *)SDL_realloc(state->uniform_buffers, (state->num_uniform_buffers + 1) * sizeof(*state->uniform_buffers));
-    if (!buffers) {
-        return false;
+    if (state->num_uniform_buffers >= SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS) {
+        return SDL_SetError("GPU render state has no free uniform-buffer slots");
     }
 
-    SDL_GPURenderStateUniformBuffer *buffer = &buffers[state->num_uniform_buffers];
+    void *buffer_data = SDL_malloc(length);
+    if (!buffer_data) {
+        return false;
+    }
+    SDL_memcpy(buffer_data, data, length);
+
+    SDL_GPURenderStateUniformBuffer *buffer = &state->uniform_buffers[state->num_uniform_buffers];
     buffer->slot_index = slot_index;
     buffer->length = length;
-    buffer->data = SDL_malloc(length);
-    if (!buffer->data) {
-        SDL_free(buffers);
-        return false;
-    }
-    SDL_memcpy(buffer->data, data, length);
+    buffer->capacity = length;
+    buffer->data = buffer_data;
 
-    state->uniform_buffers = buffers;
     ++state->num_uniform_buffers;
+    if (++state->uniform_generation == 0) {
+        ++state->uniform_generation;
+    }
     return true;
 }
 
@@ -6211,11 +6315,8 @@ void SDL_DestroyGPURenderState(SDL_GPURenderState *state)
 
     FlushRenderCommandsIfGPURenderStateNeeded(state);
 
-    if (state->num_uniform_buffers > 0) {
-        for (int i = 0; i < state->num_uniform_buffers; i++) {
-            SDL_free(state->uniform_buffers[i].data);
-        }
-        SDL_free(state->uniform_buffers);
+    for (int i = 0; i < state->num_uniform_buffers; i++) {
+        SDL_free(state->uniform_buffers[i].data);
     }
     SDL_free(state->sampler_bindings);
     SDL_free(state->storage_textures);

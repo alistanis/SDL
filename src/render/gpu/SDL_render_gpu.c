@@ -23,12 +23,17 @@
 #ifdef SDL_VIDEO_RENDER_GPU
 
 #include "../../events/SDL_windowevents_c.h"
+#include "../../gpu/SDL_sysgpu.h"
 #include "../../video/SDL_pixels_c.h"
 #include "../SDL_d3dmath.h"
 #include "../SDL_sysrender.h"
 #include "SDL_gpu_util.h"
 #include "SDL_pipeline_gpu.h"
 #include "SDL_shaders_gpu.h"
+#include <SDL3/SDL_accelerando_timing.h>
+
+SDL_COMPILE_TIME_ASSERT(render_gpu_uniform_buffer_slots,
+                        SDL_RENDER_GPU_UNIFORM_BUFFER_SLOTS == MAX_UNIFORM_BUFFERS_PER_STAGE);
 
 typedef struct GPU_VertexShaderUniformData
 {
@@ -86,6 +91,7 @@ typedef struct GPU_RenderData
 {
     bool external_device;
     SDL_GPUDevice *device;
+    const SDL_AccelerandoGPUTimingAPI *timing;
     GPU_Shaders shaders;
     GPU_PipelineCache pipeline_cache;
 
@@ -935,7 +941,7 @@ static void CalculateAdvancedShaderConstants(SDL_Renderer *renderer, const SDL_R
 }
 
 static void Draw(
-    GPU_RenderData *data, SDL_RenderCommand *cmd,
+    SDL_Renderer *renderer, GPU_RenderData *data, SDL_RenderCommand *cmd,
     Uint32 num_verts,
     Uint32 offset,
     SDL_GPUPrimitiveType prim)
@@ -1050,10 +1056,11 @@ static void Draw(
         if (custom_state->num_storage_buffers > 0) {
             SDL_BindGPUFragmentStorageBuffers(pass, 0, custom_state->storage_buffers, custom_state->num_storage_buffers);
         }
-        if (custom_state->num_uniform_buffers > 0) {
-            for (int i = 0; i < custom_state->num_uniform_buffers; i++) {
-                SDL_GPURenderStateUniformBuffer *ub = &custom_state->uniform_buffers[i];
-                SDL_PushGPUFragmentUniformData(data->state.command_buffer, ub->slot_index, ub->data, ub->length);
+        if (cmd->data.draw.num_gpu_render_state_uniform_buffers > 0) {
+            for (int i = 0; i < cmd->data.draw.num_gpu_render_state_uniform_buffers; i++) {
+                const SDL_GPURenderStateUniformSnapshot *ub = &cmd->data.draw.gpu_render_state_uniform_buffers[i];
+                const void *uniform_data = (const Uint8 *)renderer->gpu_render_state_uniform_data + ub->data_offset;
+                SDL_PushGPUFragmentUniformData(data->state.command_buffer, ub->slot_index, uniform_data, ub->length);
             }
         }
     } else {
@@ -1165,7 +1172,7 @@ static bool UploadVertices(GPU_RenderData *data, void *vertices, size_t vertsize
 // We could also fairly easily run the geometry transformations
 // on compute shaders instead of the CPU, which would be a HUGE performance win.
 // -cosmonaut
-static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
+static bool GPU_RunCommandQueueImpl(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
 {
     GPU_RenderData *data = (GPU_RenderData *)renderer->internal;
 
@@ -1245,14 +1252,13 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
 
             if (count > 2) {
                 // joined lines cannot be grouped
-                Draw(data, cmd, count, offset, SDL_GPU_PRIMITIVETYPE_LINESTRIP);
+                Draw(renderer, data, cmd, count, offset, SDL_GPU_PRIMITIVETYPE_LINESTRIP);
             } else {
                 // let's group non joined lines
                 SDL_RenderCommand *finalcmd = cmd;
                 SDL_RenderCommand *nextcmd;
                 float thiscolorscale = cmd->data.draw.color_scale;
                 SDL_BlendMode thisblend = cmd->data.draw.blend;
-                SDL_GPURenderState *thisrenderstate = cmd->data.draw.gpu_render_state;
 
                 for (nextcmd = cmd->next; nextcmd; nextcmd = nextcmd->next) {
                     const SDL_RenderCommandType nextcmdtype = nextcmd->command;
@@ -1266,7 +1272,7 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
                         break; // can't go any further on this draw call, those are joined lines
                     } else if (nextcmd->data.draw.blend != thisblend ||
                                nextcmd->data.draw.color_scale != thiscolorscale ||
-                               nextcmd->data.draw.gpu_render_state != thisrenderstate) {
+                               !SDL_RenderCommandsHaveSameGPURenderState(cmd, nextcmd)) {
                         break; // can't go any further on this draw call, different blendmode copy up next.
                     } else {
                         finalcmd = nextcmd; // we can combine copy operations here. Mark this one as the furthest okay command.
@@ -1274,7 +1280,7 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
                     }
                 }
 
-                Draw(data, cmd, count, offset, SDL_GPU_PRIMITIVETYPE_LINELIST);
+                Draw(renderer, data, cmd, count, offset, SDL_GPU_PRIMITIVETYPE_LINELIST);
                 cmd = finalcmd; // skip any copy commands we just combined in here.
             }
             break;
@@ -1291,7 +1297,6 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
             SDL_ScaleMode thisscalemode = cmd->data.draw.texture_scale_mode;
             SDL_TextureAddressMode thisaddressmode_u = cmd->data.draw.texture_address_mode_u;
             SDL_TextureAddressMode thisaddressmode_v = cmd->data.draw.texture_address_mode_v;
-            SDL_GPURenderState *thisrenderstate = cmd->data.draw.gpu_render_state;
             const SDL_RenderCommandType thiscmdtype = cmd->command;
             SDL_RenderCommand *finalcmd = cmd;
             SDL_RenderCommand *nextcmd;
@@ -1312,7 +1317,7 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
                            nextcmd->data.draw.texture_address_mode_v != thisaddressmode_v ||
                            nextcmd->data.draw.blend != thisblend ||
                            nextcmd->data.draw.color_scale != thiscolorscale ||
-                           nextcmd->data.draw.gpu_render_state != thisrenderstate) {
+                           !SDL_RenderCommandsHaveSameGPURenderState(cmd, nextcmd)) {
                     break; // can't go any further on this draw call, different texture/blendmode copy up next.
                 } else {
                     finalcmd = nextcmd; // we can combine copy operations here. Mark this one as the furthest okay command.
@@ -1326,7 +1331,7 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
             } else {
                 prim = SDL_GPU_PRIMITIVETYPE_POINTLIST;
             }
-            Draw(data, cmd, count, offset, prim);
+            Draw(renderer, data, cmd, count, offset, prim);
 
             cmd = finalcmd; // skip any copy commands we just combined in here.
             break;
@@ -1349,6 +1354,16 @@ static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, 
     }
 
     return true;
+}
+
+static bool GPU_RunCommandQueue(SDL_Renderer *renderer, SDL_RenderCommand *cmd, void *vertices, size_t vertsize)
+{
+    GPU_RenderData *data = (GPU_RenderData *)renderer->internal;
+    const bool trace = data->timing && data->timing->is_active(data->device);
+    const Uint64 start = trace ? SDL_GetTicksNS() : 0;
+    const bool result = GPU_RunCommandQueueImpl(renderer, cmd, vertices, vertsize);
+    if (trace) data->timing->add_duration(data->device, SDL_ACCELERANDO_GPU_COMMAND_FLUSH, SDL_GetTicksNS() - start);
+    return result;
 }
 
 static SDL_Surface *GPU_RenderReadPixels(SDL_Renderer *renderer, const SDL_Rect *rect)
@@ -1837,11 +1852,86 @@ static bool GPU_CreateRenderer(SDL_Renderer *renderer, SDL_Window *window, SDL_P
 
     SDL_SetPointerProperty(SDL_GetRendererProperties(renderer), SDL_PROP_RENDERER_GPU_DEVICE_POINTER, data->device);
 
+    data->timing = SDL_GetPointerProperty(SDL_GetGPUDeviceProperties(data->device), SDL_PROP_GPU_ACCELERANDO_TIMING_POINTER, NULL);
+    if (data->timing && (data->timing->version != SDL_ACCELERANDO_GPU_TIMING_VERSION ||
+                         data->timing->sample_size != sizeof(SDL_AccelerandoGPUTimingSample))) {
+        data->timing = NULL;
+    }
+
     return true;
 }
 
 SDL_RenderDriver GPU_RenderDriver = {
     GPU_CreateRenderer, "gpu"
 };
+
+// ============================================================================
+// VectorBreach-Crescendo extension: expose the inner SDL_GPUTexture so
+// platform-specific post-processing (e.g. MetalFX on Apple) can reach down
+// to the native texture handle.  Safe on any platform — returns NULL for
+// non-GPU-backed renderers or textures.
+// ============================================================================
+
+SDL_GPUTexture *SDL_GetRenderTextureGPUHandle(SDL_Renderer *renderer, SDL_Texture *texture)
+{
+    if (renderer == NULL || texture == NULL) {
+        return NULL;
+    }
+    if (texture->internal == NULL) {
+        return NULL;
+    }
+    // Renderer must be the GPU driver — name check keeps other backends safe.
+    const char *rendererName = SDL_GetRendererName(renderer);
+    if (rendererName == NULL || SDL_strcmp(rendererName, "gpu") != 0) {
+        return NULL;
+    }
+    GPU_TextureData *data = (GPU_TextureData *)texture->internal;
+    return data->texture;
+}
+
+// COUNTERPOINT LOCAL PATCH: ordered native post-processing must use this
+// renderer's unsubmitted command buffer. SDL_FlushRenderer ends GPU passes
+// but does not submit that buffer; a separate native queue submission could
+// otherwise read the scene before its producer. Borrowed until next present.
+SDL_GPUCommandBuffer *SDL_GetGPURendererCommandBufferForInterop(SDL_Renderer *renderer)
+{
+    if (renderer == NULL || SDL_GetGPURendererDevice(renderer) == NULL ||
+        !SDL_FlushRenderer(renderer)) {
+        return NULL;
+    }
+    GPU_RenderData *data = (GPU_RenderData *)renderer->internal;
+    SDL_assert(data->state.render_pass == NULL);
+    return data->state.command_buffer;
+}
+
+// COUNTERPOINT LOCAL PATCH: a shared world shadow texture is written by a
+// separate GPU command buffer after the renderer has sampled it. Flushing
+// only records those reads, so submit them before that independent write.
+// Acquire the replacement first to keep the renderer usable on failure.
+// This neither presents the window nor waits for the GPU.
+SDL_DECLSPEC bool SDLCALL SDL_SubmitGPURendererCommandsForInterop(SDL_Renderer *renderer)
+{
+    SDL_GPUCommandBuffer *pending = SDL_GetGPURendererCommandBufferForInterop(renderer);
+    if (pending == NULL) {
+        return false;
+    }
+    GPU_RenderData *data = (GPU_RenderData *)renderer->internal;
+    SDL_GPUCommandBuffer *replacement = SDL_AcquireGPUCommandBuffer(data->device);
+    if (replacement == NULL) {
+        return false;
+    }
+    data->state.command_buffer = replacement;
+    return SDL_SubmitGPUCommandBuffer(pending);
+}
+
+#else
+
+// Keep the private interop entry point linkable in client builds that retain
+// only SDL's compatibility renderer. World shadows stay unavailable there.
+SDL_DECLSPEC bool SDLCALL SDL_SubmitGPURendererCommandsForInterop(SDL_Renderer *renderer)
+{
+    (void)renderer;
+    return SDL_SetError("SDL_GPU renderer is unavailable");
+}
 
 #endif // SDL_VIDEO_RENDER_GPU

@@ -523,6 +523,155 @@ static int SDLCALL iostrm_testMemWithFree(void *arg)
 }
 
 /**
+ * Tests memory properties first requested after reading and seeking.
+ */
+static int SDLCALL iostrm_testMemoryProperties(void *arg)
+{
+    const size_t size = sizeof(IOStreamAlphabetString) - 1;
+    int readonly;
+
+    for (readonly = 0; readonly < 2; ++readonly) {
+        char *mem = (char *)SDL_malloc(size);
+        char buffer[5];
+        SDL_IOStream *rw;
+        SDL_PropertiesID props;
+
+        SDLTest_AssertCheck(mem != NULL, "Allocate backing memory for readonly=%d", readonly);
+        if (!mem) {
+            return TEST_ABORTED;
+        }
+        SDL_memcpy(mem, IOStreamAlphabetString, size);
+        rw = readonly ? SDL_IOFromConstMem(mem, size) : SDL_IOFromMem(mem, size);
+        SDLTest_AssertCheck(rw != NULL, "Open memory stream for readonly=%d", readonly);
+        if (!rw) {
+            SDL_free(mem);
+            return TEST_ABORTED;
+        }
+
+        /* Use the stream before its properties have been materialized. */
+        SDL_zeroa(buffer);
+        SDLTest_AssertCheck(SDL_ReadIO(rw, buffer, sizeof(buffer)) == sizeof(buffer), "Read before requesting properties");
+        SDLTest_AssertCheck(SDL_memcmp(buffer, mem, sizeof(buffer)) == 0, "Verify initial read contents");
+        SDLTest_AssertCheck(SDL_SeekIO(rw, -(Sint64)sizeof(buffer), SDL_IO_SEEK_END) == (Sint64)(size - sizeof(buffer)), "Seek before requesting properties");
+
+        props = SDL_GetIOProperties(rw);
+        SDLTest_AssertCheck(props != 0, "Get late memory properties for readonly=%d", readonly);
+        if (!props) {
+            SDL_CloseIO(rw);
+            SDL_free(mem);
+            return TEST_ABORTED;
+        }
+        SDLTest_AssertCheck(SDL_GetPointerProperty(props, SDL_PROP_IOSTREAM_MEMORY_POINTER, NULL) == mem, "Memory property points to the original base, not the current position");
+        SDLTest_AssertCheck(SDL_GetNumberProperty(props, SDL_PROP_IOSTREAM_MEMORY_SIZE_NUMBER, -1) == (Sint64)size, "Memory size property preserves the supplied size for readonly=%d", readonly);
+        SDLTest_AssertCheck(SDL_GetIOSize(rw) == (Sint64)size, "Stream size agrees with memory size property");
+        SDLTest_AssertCheck(SDL_TellIO(rw) == (Sint64)(size - sizeof(buffer)), "Requesting properties does not change the stream position");
+        SDLTest_AssertCheck(SDL_SetNumberProperty(props, "test.iostream.marker", 73), "Set a custom stream property");
+        SDLTest_AssertCheck(SDL_GetIOProperties(rw) == props, "Repeated property access returns the same group");
+        SDLTest_AssertCheck(SDL_GetNumberProperty(props, "test.iostream.marker", -1) == 73, "Repeated property access preserves custom properties");
+
+        SDL_zeroa(buffer);
+        SDLTest_AssertCheck(SDL_ReadIO(rw, buffer, sizeof(buffer)) == sizeof(buffer), "Read after requesting properties");
+        SDLTest_AssertCheck(SDL_memcmp(buffer, mem + size - sizeof(buffer), sizeof(buffer)) == 0, "Verify read resumes from the previous position");
+        SDLTest_AssertCheck(SDL_SeekIO(rw, 0, SDL_IO_SEEK_SET) == 0, "Seek after requesting properties");
+        SDLTest_AssertCheck(SDL_WriteIO(rw, "z", 1) == (readonly ? 0u : 1u), "Property creation preserves readonly=%d", readonly);
+        SDLTest_AssertCheck(mem[0] == (readonly ? 'A' : 'z'), "Verify backing memory after write attempt");
+
+        /* Both mutable and const streams can transfer cleanup to a callback. */
+        free_call_count = 0;
+        if (!SDL_SetPointerProperty(props, SDL_PROP_IOSTREAM_MEMORY_FREE_FUNC_POINTER, test_free)) {
+            SDLTest_AssertCheck(false, "Set memory cleanup callback");
+            SDL_CloseIO(rw);
+            SDL_free(mem);
+            return TEST_ABORTED;
+        }
+        SDLTest_AssertCheck(SDL_CloseIO(rw), "Close memory stream with late properties");
+        SDLTest_AssertCheck(free_call_count == 1, "Late properties retain the cleanup callback exactly once for readonly=%d", readonly);
+    }
+    return TEST_COMPLETED;
+}
+
+/**
+ * Tests growth before and after requesting dynamic memory properties, with
+ * automatic cleanup and explicit ownership transfer.
+ */
+static int SDLCALL iostrm_testDynamicMemProperties(void *arg)
+{
+    int mode;
+
+    /* 0: never request properties, 1: late properties, 2: transfer memory. */
+    for (mode = 0; mode < 3; ++mode) {
+        char block[1025];
+        char buffer[1025];
+        SDL_IOStream *rw = SDL_IOFromDynamicMem();
+        SDL_PropertiesID props = 0;
+        char *mem = NULL;
+        int i;
+
+        SDLTest_AssertCheck(rw != NULL, "Open dynamic memory stream for cleanup mode=%d", mode);
+        if (!rw) {
+            return TEST_ABORTED;
+        }
+
+        /* Exceed the default allocation chunk twice before requesting properties. */
+        SDL_memset(block, 'P', sizeof(block));
+        for (i = 0; i < 2; ++i) {
+            SDLTest_AssertCheck(SDL_WriteIO(rw, block, sizeof(block)) == sizeof(block), "Grow dynamic memory before property access, write=%d", i);
+        }
+        SDLTest_AssertCheck(SDL_GetIOSize(rw) == (Sint64)(2 * sizeof(block)), "Verify size after initial growth");
+        if (mode != 0) {
+            props = SDL_GetIOProperties(rw);
+            SDLTest_AssertCheck(props != 0, "Create properties after dynamic memory growth");
+            if (!props) {
+                SDL_CloseIO(rw);
+                return TEST_ABORTED;
+            }
+            mem = (char *)SDL_GetPointerProperty(props, SDL_PROP_IOSTREAM_DYNAMIC_MEMORY_POINTER, NULL);
+            SDLTest_AssertCheck(mem != NULL, "Late property exposes existing dynamic memory");
+            if (mem) {
+                SDLTest_AssertCheck(SDL_memcmp(mem, block, sizeof(block)) == 0, "Late property preserves previously written data");
+            }
+            SDLTest_AssertCheck(SDL_TellIO(rw) == (Sint64)(2 * sizeof(block)), "Late properties preserve the dynamic stream position");
+        }
+
+        /* Grow again, so an existing property must follow the reallocation. */
+        SDL_memset(block, 'Q', sizeof(block));
+        for (i = 0; i < 2; ++i) {
+            SDLTest_AssertCheck(SDL_WriteIO(rw, block, sizeof(block)) == sizeof(block), "Grow dynamic memory after property access, write=%d", i);
+        }
+        SDLTest_AssertCheck(SDL_GetIOSize(rw) == (Sint64)(4 * sizeof(block)), "Verify size after subsequent growth");
+        SDLTest_AssertCheck(SDL_SeekIO(rw, 2 * (Sint64)sizeof(block), SDL_IO_SEEK_SET) == 2 * (Sint64)sizeof(block), "Seek to data written after property access");
+        SDL_zeroa(buffer);
+        SDLTest_AssertCheck(SDL_ReadIO(rw, buffer, sizeof(buffer)) == sizeof(buffer), "Read after dynamic memory growth");
+        SDLTest_AssertCheck(SDL_memcmp(buffer, block, sizeof(block)) == 0, "Verify stream data after dynamic memory growth");
+
+        if (mode != 0) {
+            SDLTest_AssertCheck(SDL_GetIOProperties(rw) == props, "Dynamic memory retains its property group across growth");
+            mem = (char *)SDL_GetPointerProperty(props, SDL_PROP_IOSTREAM_DYNAMIC_MEMORY_POINTER, NULL);
+            SDLTest_AssertCheck(mem != NULL, "Dynamic memory property remains available after growth");
+            if (mem) {
+                SDLTest_AssertCheck(SDL_memcmp(mem + 2 * sizeof(block), block, sizeof(block)) == 0, "Dynamic memory property points to the current allocation");
+                SDL_memset(buffer, 'P', sizeof(buffer));
+                SDLTest_AssertCheck(SDL_memcmp(mem, buffer, sizeof(buffer)) == 0, "Growth retains the original data");
+            }
+        }
+
+        if (mode == 2) {
+            if (!SDL_SetPointerProperty(props, SDL_PROP_IOSTREAM_DYNAMIC_MEMORY_POINTER, NULL)) {
+                SDLTest_AssertCheck(false, "Transfer ownership of dynamic memory");
+                SDL_CloseIO(rw);
+                return TEST_ABORTED;
+            }
+        }
+        SDLTest_AssertCheck(SDL_CloseIO(rw), "Close dynamic memory stream for cleanup mode=%d", mode);
+        if (mode == 2 && mem) {
+            SDLTest_AssertCheck(SDL_memcmp(mem, buffer, sizeof(buffer)) == 0, "Transferred memory remains valid after closing the stream");
+            SDL_free(mem);
+        }
+    }
+    return TEST_COMPLETED;
+}
+
+/**
  * Tests dynamic memory
  *
  * \sa SDL_IOFromDynamicMem
@@ -913,10 +1062,19 @@ static const SDLTest_TestCaseReference iostrmTest12 = {
     iostrm_testConstMemEmpty, "iostrm_testConstMemEmpty", "Tests opening empty (const) memory stream", TEST_ENABLED
 };
 
+static const SDLTest_TestCaseReference iostrmTest13 = {
+    iostrm_testMemoryProperties, "iostrm_testMemoryProperties", "Tests late mutable and const memory properties", TEST_ENABLED
+};
+
+static const SDLTest_TestCaseReference iostrmTest14 = {
+    iostrm_testDynamicMemProperties, "iostrm_testDynamicMemProperties", "Tests late dynamic memory properties and cleanup", TEST_ENABLED
+};
+
 /* Sequence of IOStream test cases */
 static const SDLTest_TestCaseReference *iostrmTests[] = {
     &iostrmTest1, &iostrmTest2, &iostrmTest3, &iostrmTest4, &iostrmTest5, &iostrmTest6,
-    &iostrmTest7, &iostrmTest8, &iostrmTest9, &iostrmTest10, &iostrmTest11, &iostrmTest12, NULL
+    &iostrmTest7, &iostrmTest8, &iostrmTest9, &iostrmTest10, &iostrmTest11, &iostrmTest12,
+    &iostrmTest13, &iostrmTest14, NULL
 };
 
 /* IOStream test suite (global) */

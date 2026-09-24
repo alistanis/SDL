@@ -1,4 +1,6 @@
-# Vector Breach GPU fence regression
+# Vector Breach GPU regressions
+
+## GPU fences
 
 `testvectorbreachfences.c` uses public SDL GPU APIs and creates no window or
 swapchain. It initializes the video backend loader and submits real uploads,
@@ -61,3 +63,36 @@ Run both validation modes when changing Metal fence ownership. Keep optional
 Afterglow/Accelerando Metal diagnostics disabled for the ordinary regression;
 run additional diagnostic-enabled checks separately when changing callback
 lifetimes. This test does not cover presentation/drawable fences or GPU capture.
+
+## Metal window lifetime on macOS
+
+The same CMake project builds `testmetalwindowlifetime` on native macOS and
+registers `gpu_metal_window_lifetime` with CTest. It is excluded from iOS, tvOS,
+and visionOS builds. The target enables Objective-C ARC and links Cocoa and
+QuartzCore directly as well as the selected SDL library.
+
+The test creates, claims for a Metal GPU device, releases, and destroys eight
+small hidden windows. It captures weak references to each window's Metal view
+and `CAMetalLayer`, then drains autorelease pools, the Cocoa run loop, and Core
+Animation transactions. It checks that all layers are released while the GPU
+device remains alive and after the device is destroyed. This detects the
+window data ARC leak without comparing process memory measurements.
+
+It does not acquire a drawable or render a frame. Consequently it does not
+independently validate drawable or swapchain texture ownership, presentation
+pacing, or performance. The cleanup allowance and CTest's 30 second timeout are
+cleanup/deadlock bounds, not timing requirements.
+
+Status 0 means all layers were released; 1 means failure; 2 means invalid
+arguments. Status 77 means Cocoa/Metal was unavailable or Cocoa still retained
+a Metal view, making the layer ownership observation inconclusive. CTest reports
+77 as skipped, not passed. Keep skipped checks explicit in validation reports.
+
+If hidden-window behavior is inconclusive, run the executable with `--show` to
+repeat the same checks with small visible windows:
+
+```sh
+/path/to/fence-check-build/testmetalwindowlifetime --show
+```
+
+Multi-configuration generators may place the executable under `Release/`.

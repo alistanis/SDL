@@ -9,3 +9,14 @@ add_test(NAME gpu_fences_debug COMMAND testvectorbreachfences)
 add_test(NAME gpu_fences_release COMMAND testvectorbreachfences --no-debug)
 set_tests_properties(gpu_fences_debug gpu_fences_release PROPERTIES
     SKIP_RETURN_CODE 77 TIMEOUT 130 RUN_SERIAL TRUE)
+
+if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    enable_language(OBJC)
+    add_executable(testmetalwindowlifetime testmetalwindowlifetime.m)
+    target_compile_options(testmetalwindowlifetime PRIVATE -fobjc-arc)
+    target_link_libraries(testmetalwindowlifetime PRIVATE SDL3::SDL3
+        "-framework Cocoa" "-framework QuartzCore")
+    add_test(NAME gpu_metal_window_lifetime COMMAND testmetalwindowlifetime)
+    set_tests_properties(gpu_metal_window_lifetime PROPERTIES
+        SKIP_RETURN_CODE 77 TIMEOUT 30 RUN_SERIAL TRUE)
+endif()

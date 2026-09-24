@@ -1,5 +1,9 @@
 # SDL 3.4.16 integration, September 24, 2026
 
+This record preserves the initial candidate validation below. The subsequent
+[promotion update and fix audit](#promotion-update-and-fix-audit) records the
+current maintenance decision; historical failures and limits are retained.
+
 The candidate branch is `ccooper/sdl-3.4.16`. Source integration commit
 `a6a746d94edbf596531019017bfb38858b0439fd` merges released upstream tag
 `release-3.4.16` (`fa2c02bb6e21974a89ea9824bc53c9932abe5f9c`) into the shared
@@ -186,3 +190,57 @@ Accelerando logs use `build-cpp/shared-sdl-3.4.16-*`; fork regressions reuse
 `build-cpp/duo-validation/sdl-3.4.16-*`. Afterglow and Counterpoint logs use
 `build/shared-sdl-3.4.16-*` in their respective checkouts. The iOS archive and its
 validation receipt reuse `build-cpp/ios-archive/Accelerando.xcarchive`.
+
+## Promotion update and fix audit
+
+Later on September 24, the user authorized coordinated promotion of
+`ccooper/sdl-3.4.16` to all three games. It is now the common integration branch.
+The focused Afterglow and Counterpoint failures above were investigated and
+repaired on their `main` branches, including the invalid telegraph fixture,
+navigation defects, stale test assumptions, and native allocation attribution.
+The consumer promotion commits record their final pins and validation. The
+initial results above remain historical evidence; they are not a claim about
+the final consumer suites. Android package acceptance, physical device checks,
+and presentation pacing remain subject to the recorded limits.
+
+A source and history audit of `df0089b020f4d749c04820f094cf6023d65bdec1`
+confirmed that every shared fork fix is retained:
+
+- All 24 commits after the original SDL 3.4.12 base through shared fork tip
+  `da9acc85c05c52a693ae48d59a8b1ecb32c00c9d` are ancestors of this integration.
+- Of the 29 files modified by that original fork, 24 are byte identical at the
+  audited revision. These include CoreAudio guards, IO fixes and regressions,
+  UIKit geometry and refresh handling, renderer uniform snapshots, interop,
+  CPU timing, and the standalone fork tests. The remaining files are the
+  maintenance README and four source files with upstream changes.
+- The entire Metal GPU delta from the previous fork is patch equivalent to
+  upstream `bcbdcaf6e`, with stable patch ID
+  `74e6bf2572f5ac53d904f521f345aba2780983ed`. Custom pools, native interop,
+  optional diagnostics, and clearing the native command buffer only after the
+  final fence reference remain intact.
+- The other three source deltas add upstream GPU transfer usage validation,
+  Metal buffer allocation checks, and Vulkan attachment, render pass, and
+  pending batch corrections. The earlier empty sampler and Vulkan command
+  pool cleanup fixes remain present.
+- The constant memory size correction in original `db11b3ae5`, the rewritten
+  submission `9e7f23ce7`, and upstream `70e125ba8` has the same production patch
+  ID, `df77bc31bffe543e04ff9790d6c92b241ec7a6af`. The fork also retains its broader
+  tests of late properties, stream position, dynamic growth, and ownership.
+- The six property initializers and `SDL_GetIOProperties` match the rewritten
+  allocation failure submission `647503725` and upstream `7f3d0638` after
+  ignoring comments and whitespace. Their boolean results, failure cleanup,
+  delayed publication, and retry behavior are preserved. The fork additionally
+  retains its isolated allocation failure regression.
+
+All local branches and published `alistanis/SDL` branch heads were checked.
+The two rewritten IO submission branches add no missing production repair.
+The separate local `ccooper/metal-display-link-experiment` commits `1db2402c2`
+and `f431d3cbd` remain outside the integration deliberately. They contain the
+unaccepted CAMetalDisplayLink pacing experiment and additional GPU completion
+measurement, including an extra callback with measurement overhead. The
+Accelerando pacing investigation explicitly preserved them as unpublished
+experiments without advancing the shared pin or establishing a pacing fix.
+Its separate previous-texture-release patch likewise lacked evidence for
+promotion. These experiments are preserved for investigation and are not
+missing shared production fixes. No SDL source changes were needed for this
+audit or promotion update.

@@ -5,26 +5,32 @@ maintained at [alistanis/SDL](https://github.com/alistanis/SDL). It is an altere
 source distribution under SDL's existing license. Upstream copyright notices
 and commit authors are retained.
 
-`ccooper/vector-breach` is the shared integration branch. Accelerando, Afterglow,
+`ccooper/sdl-3.4.16` is the shared integration branch. Accelerando, Afterglow,
 and Counterpoint consume the **same immutable commit** through `third_party/SDL`
 submodules. Fixes belong here; do not grow game-specific SDL branches or patch
 stacks. SDL_mixer and FreeType remain separate dependencies. The original Go
 Vector Breach does not consume this fork.
 
-## Stable release candidate
+## Current stable integration
 
-`main` mirrors upstream development SDL. The separate `ccooper/sdl-3.4.16`
-branch merges the released SDL 3.4.16 tag into the shared fork, retaining the
-newer backports and local corrections. It is a candidate for coordinated
-consumer promotion; it does not advance the games' dependency pins or replace
-`ccooper/vector-breach`. See the [integration and validation record](docs/README-vector-breach-3.4.16.md)
-for the reconciliation and acceptance limits.
+`main` tracks upstream development SDL. The `ccooper/sdl-3.4.16` branch merges
+the released SDL 3.4.16 tag into the shared fork, retaining its newer backports
+and local corrections. This is now the target for coordinated dependency
+updates in all three games. `ccooper/vector-breach` preserves the previous
+integration history; new shared fixes belong on `ccooper/sdl-3.4.16`.
+
+The [integration and validation record](docs/README-vector-breach-3.4.16.md)
+preserves the initial candidate results and documents the subsequent promotion
+decision and fix preservation audit. Consumer commits record the exact common
+SDL revision and their own validation. Promotion does not resolve the recorded
+Android packaging, physical device, or presentation pacing limits.
 
 ## Initial common revision
 
-The base is SDL 3.4.12 (`f87239e71e42da91ca317a12eefb82cfbf3393eb`). Consolidation
-keeps the existing base so the dependency extraction can be validated separately
-from a release upgrade.
+The initial common base was SDL 3.4.12
+(`f87239e71e42da91ca317a12eefb82cfbf3393eb`). Consolidation retained that base
+so dependency extraction could be validated separately from the later release
+upgrade. The current integration retains that complete fork history.
 
 Upstream changes were cherry-picked as individual commits with their authors:
 

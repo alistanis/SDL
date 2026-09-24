@@ -132,6 +132,10 @@ static AfterglowMetalPresentations *METAL_INTERNAL_AfterglowCreatePresentations(
 {
     const char *path = SDL_getenv("AFTERGLOW_METAL_PRESENTATIONS");
     if (!path || !*path) return nil;
+#if TARGET_OS_SIMULATOR
+    // Simulator SDKs omit MTLDrawable's presentation callbacks and timestamps.
+    SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/presentations unsupported on simulator");
+#else
     if (@available(macOS 10.15.4, iOS 10.3, tvOS 10.3, *)) {
         AfterglowMetalPresentations *owner = [[AfterglowMetalPresentations alloc] initWithPath:path];
         if (!owner) {
@@ -145,9 +149,11 @@ static AfterglowMetalPresentations *METAL_INTERNAL_AfterglowCreatePresentations(
         return owner;
     }
     SDL_LogError(SDL_LOG_CATEGORY_GPU, "AfterglowMetal/presentations unsupported OS");
+#endif
     return nil;
 }
 
+#if !TARGET_OS_SIMULATOR
 static Uint32 METAL_INTERNAL_AfterglowReservePresentation(
     AfterglowMetalPresentations *owner, Uint64 submission, Uint64 layer,
     Uint64 drawableID, bool nilDrawable)
@@ -198,6 +204,7 @@ static void METAL_INTERNAL_AfterglowRecordPresentation(
         }];
     }
 }
+#endif
 
 static void METAL_INTERNAL_AfterglowWriteJSONString(FILE *file, const char *value)
 {
@@ -5175,6 +5182,7 @@ static bool METAL_SubmitImpl(
         // Enqueue present requests, if applicable
         for (Uint32 i = 0; i < metalCommandBuffer->windowDataCount; i += 1) {
             MetalWindowData *windowData = metalCommandBuffer->windowDatas[i];
+#if !TARGET_OS_SIMULATOR
             if (renderer->afterglowPresentations) {
                 if (windowData->afterglowPresentationLayer == 0) {
                     windowData->afterglowPresentationLayer = ++renderer->afterglowNextPresentationLayer;
@@ -5182,6 +5190,7 @@ static bool METAL_SubmitImpl(
                 METAL_INTERNAL_AfterglowRecordPresentation(renderer->afterglowPresentations,
                     windowData->drawable, diagnosticSubmission, windowData->afterglowPresentationLayer);
             }
+#endif
             if (trace) {
                 METAL_INTERNAL_TimingSignpost(renderer, SDL_ACCELERANDO_GPU_PRESENT_DRAWABLE, true);
                 start = SDL_GetTicksNS();

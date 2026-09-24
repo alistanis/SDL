@@ -210,6 +210,44 @@ SDL_SystemTheme UIKit_GetSystemTheme(void)
     return SDL_SYSTEM_THEME_UNKNOWN;
 }
 
+void UIKit_LogWindowGeometry(SDL_Window *window, const char *source)
+{
+    if (!window || !window->internal || !SDL_GetHintBoolean("AFTERGLOW_UIKIT_GEOMETRY", false)) {
+        return;
+    }
+
+    SDL_UIKitWindowData *data = (__bridge SDL_UIKitWindowData *)window->internal;
+    UIView *view = data.viewcontroller.view;
+    const CGRect bounds = view.bounds;
+    const CGRect frame = view.frame;
+    const CGRect windowBounds = data.uiwindow.bounds;
+    CGRect sceneBounds = CGRectZero;
+    CGRect screenBounds = CGRectZero;
+    CGSize drawable = CGSizeZero;
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        if (data.uiwindow.windowScene) {
+            sceneBounds = data.uiwindow.windowScene.coordinateSpace.bounds;
+        }
+    }
+#ifndef SDL_PLATFORM_VISIONOS
+    screenBounds = data.uiwindow.screen.bounds;
+#endif
+#if defined(SDL_VIDEO_VULKAN) || defined(SDL_VIDEO_METAL)
+    if ([view.layer isKindOfClass:[CAMetalLayer class]]) {
+        drawable = ((CAMetalLayer *)view.layer).drawableSize;
+    }
+#endif
+    SDL_Log("AfterglowUIKit/geometry source=%s sdl=%dx%d window=%.1fx%.1f view=%.1fx%.1f frame=%.1f,%.1f %.1fx%.1f scene=%.1fx%.1f screen=%.1fx%.1f scale=%.3f drawable=%.1fx%.1f",
+            source, window->w, window->h,
+            (double)windowBounds.size.width, (double)windowBounds.size.height,
+            (double)bounds.size.width, (double)bounds.size.height,
+            (double)frame.origin.x, (double)frame.origin.y,
+            (double)frame.size.width, (double)frame.size.height,
+            (double)sceneBounds.size.width, (double)sceneBounds.size.height,
+            (double)screenBounds.size.width, (double)screenBounds.size.height,
+            (double)view.layer.contentsScale, (double)drawable.width, (double)drawable.height);
+}
+
 #ifdef SDL_PLATFORM_VISIONOS
 CGRect UIKit_ComputeViewFrame(SDL_Window *window)
 {
@@ -226,6 +264,16 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
      * is used on an iPad. */
     if (data != nil && data.uiwindow != nil) {
         frame = data.uiwindow.bounds;
+        if (@available(iOS 13.0, tvOS 13.0, *)) {
+            if (data.uiwindow.windowScene != nil) {
+                // Local fix: scene geometry is authoritative. A resizable scene
+                // can be portrait even when the app only requests landscape,
+                // notably on the inner iPhone Duo display. Do not apply the
+                // legacy status-bar orientation workaround to an attached scene.
+                UIKit_LogWindowGeometry(window, "compute/scene");
+                return frame;
+            }
+        }
     }
 
 #ifndef SDL_PLATFORM_TVOS
@@ -251,6 +299,7 @@ CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen)
     }
 #endif
 
+    UIKit_LogWindowGeometry(window, "compute/legacy");
     return frame;
 }
 #endif // SDL_PLATFORM_VISIONOS

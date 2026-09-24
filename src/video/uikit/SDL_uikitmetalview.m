@@ -35,6 +35,7 @@
 
 #import "SDL_uikitwindow.h"
 #import "SDL_uikitmetalview.h"
+#import "SDL_uikitvideo.h"
 
 @implementation SDL_uikitmetalview
 
@@ -74,6 +75,7 @@
         metallayer.drawableSize.height != size.height) {
         metallayer.drawableSize = size;
         SDL_SendWindowEvent([self getSDLWindow], SDL_EVENT_WINDOW_METAL_VIEW_RESIZED, 0, 0);
+        UIKit_LogWindowGeometry([self getSDLWindow], "metal/updateDrawableSize");
     }
 }
 

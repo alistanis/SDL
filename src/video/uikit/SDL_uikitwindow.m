@@ -63,6 +63,19 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, UIWindow
     CGRect frame = UIKit_ComputeViewFrame(window);
 #else
     CGRect frame = UIKit_ComputeViewFrame(window, displaydata.uiscreen);
+#ifndef SDL_PLATFORM_TVOS
+    bool sceneGeometry = false;
+#endif
+    if (@available(iOS 13.0, tvOS 13.0, *)) {
+        if (uiwindow.windowScene != nil) {
+            // Match UIKit_ComputeViewFrame's scene path before window->internal
+            // has been installed, including launch on a portrait inner display.
+            frame = uiwindow.bounds;
+#ifndef SDL_PLATFORM_TVOS
+            sceneGeometry = true;
+#endif
+        }
+    }
 #endif
 
     int width = (int)frame.size.width;
@@ -86,7 +99,7 @@ static bool SetupWindowData(SDL_VideoDevice *_this, SDL_Window *window, UIWindow
 #endif
 
 #if !defined(SDL_PLATFORM_TVOS) && !defined(SDL_PLATFORM_VISIONOS)
-    if (displaydata.uiscreen == [UIScreen mainScreen]) {
+    if (!sceneGeometry && displaydata.uiscreen == [UIScreen mainScreen]) {
         NSUInteger orients = UIKit_GetSupportedOrientations(window);
         BOOL supportsLandscape = (orients & UIInterfaceOrientationMaskLandscape) != 0;
         BOOL supportsPortrait = (orients & (UIInterfaceOrientationMaskPortrait | UIInterfaceOrientationMaskPortraitUpsideDown)) != 0;

@@ -49,6 +49,17 @@ not upstream SDL APIs. `ACCEL_METAL_DIAGNOSTICS`, `ACCEL_METAL_SIGNPOSTS`,
 `AFTERGLOW_METAL_DIAGNOSTICS`, `AFTERGLOW_METAL_PASS_TIMESTAMPS`, and
 `AFTERGLOW_METAL_PRESENTATIONS` remain opt-in. Keep them disabled for normal
 performance acceptance. `AFTERGLOW_IOS_REFRESH_RATE` remains an application hint.
+Presentation recording is unsupported on Apple simulators because their Metal
+SDK omits drawable presentation callbacks and timestamps. Requesting
+`AFTERGLOW_METAL_PRESENTATIONS` there logs that limitation without allocating a
+recorder; device and macOS recording remain available.
+
+UIKit windows attached to a scene use their actual window bounds during frame
+calculation and initial setup. The legacy orientation workaround remains for
+windows without a scene; it must not force the Duo inner display into landscape.
+For simulator investigations, `AFTERGLOW_UIKIT_GEOMETRY=1` logs SDL, window, view,
+scene, screen and Metal drawable dimensions at layout changes. Keep it disabled
+for performance acceptance.
 
 The fence fixes improve waiting and lifetime correctness. They do not establish
 a fix for Accelerando's intermittent presentation stalls or pacing target.

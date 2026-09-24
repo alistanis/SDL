@@ -43,6 +43,9 @@ extern CGRect UIKit_ComputeViewFrame(SDL_Window *window, UIScreen *screen);
 
 extern API_AVAILABLE(ios(13.0)) UIWindowScene *UIKit_GetActiveWindowScene(void);
 
+// Local opt-in geometry diagnostics; disabled unless AFTERGLOW_UIKIT_GEOMETRY=1.
+extern void UIKit_LogWindowGeometry(SDL_Window *window, const char *source);
+
 extern void UIKit_SetGameControllerInteraction(bool enabled);
 extern void UIKit_SetViewGameControllerInteraction(UIView *view, bool enabled);
 

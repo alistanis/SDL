@@ -11,6 +11,15 @@ submodules. Fixes belong here; do not grow game-specific SDL branches or patch
 stacks. SDL_mixer and FreeType remain separate dependencies. The original Go
 Vector Breach does not consume this fork.
 
+## Stable release candidate
+
+`main` mirrors upstream development SDL. The separate `ccooper/sdl-3.4.16`
+branch merges the released SDL 3.4.16 tag into the shared fork, retaining the
+newer backports and local corrections. It is a candidate for coordinated
+consumer promotion; it does not advance the games' dependency pins or replace
+`ccooper/vector-breach`. See the [integration and validation record](docs/README-vector-breach-3.4.16.md)
+for the reconciliation and acceptance limits.
+
 ## Initial common revision
 
 The base is SDL 3.4.12 (`f87239e71e42da91ca317a12eefb82cfbf3393eb`). Consolidation

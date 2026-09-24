@@ -10,6 +10,12 @@ add_test(NAME gpu_fences_release COMMAND testvectorbreachfences --no-debug)
 set_tests_properties(gpu_fences_debug gpu_fences_release PROPERTIES
     SKIP_RETURN_CODE 77 TIMEOUT 130 RUN_SERIAL TRUE)
 
+add_executable(testioproperties testioproperties.c)
+target_compile_features(testioproperties PRIVATE c_std_11)
+target_link_libraries(testioproperties PRIVATE SDL3::SDL3)
+add_test(NAME io_properties_allocation_failure COMMAND testioproperties)
+set_tests_properties(io_properties_allocation_failure PROPERTIES TIMEOUT 30)
+
 if(APPLE AND CMAKE_SYSTEM_NAME STREQUAL "Darwin")
     enable_language(OBJC)
     add_executable(testmetalwindowlifetime testmetalwindowlifetime.m)

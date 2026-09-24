@@ -1,4 +1,4 @@
-# Vector Breach GPU regressions
+# Vector Breach regressions
 
 ## GPU fences
 
@@ -96,3 +96,21 @@ repeat the same checks with small visible windows:
 ```
 
 Multi-configuration generators may place the executable under `Release/`.
+
+## Lazy IO properties under allocation failure
+
+The standalone project also builds `testioproperties` and registers
+`io_properties_allocation_failure` with CTest. This portable test needs no
+video, audio, GPU, or SDL_test support and has no skip path.
+
+It installs counting memory functions before SDL initialization, writes a
+dynamic memory stream before requesting its properties, then injects failure
+at each allocation during the first property request. It verifies that failure
+returns zero, immediate close releases the backing buffer, and retry preserves
+the data, size, and position. A third path transfers ownership by setting the
+buffer property to NULL and verifies that the caller retains the buffer after
+close. Each case checks allocation balance against warmed global bookkeeping.
+
+This specifically covers dynamic stream property creation. The ordinary
+IOStream automation suite covers mutable and constant memory properties;
+this test does not inject faults into their initializers or file properties.

@@ -64,6 +64,13 @@ for performance acceptance.
 The fence fixes improve waiting and lifetime correctness. They do not establish
 a fix for Accelerando's intermittent presentation stalls or pacing target.
 
+The September 24, 2026 [upstream performance review](docs/README-vector-breach-performance.md)
+records focused backports for IO allocation, empty GPU sampler bindings,
+software alpha copies, and Metal/Vulkan resource lifetime. It includes the
+local corrections for lazy memory stream properties and allocation failure,
+validation evidence, and deferred candidates. These commits do not automatically
+advance consumer submodule pins.
+
 ## Development and coordinated updates
 
 Use one sibling SDL checkout to develop fixes. Configure each game with its
